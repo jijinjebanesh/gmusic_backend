@@ -8,14 +8,46 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const tokenFile = process.env.GDRIVE_TOKEN_PATH || path.resolve(here, '../data/token.json');
 const scopes = ['https://www.googleapis.com/auth/drive.readonly'];
 
-export async function readInstalledCredentials(file = process.env.GDRIVE_CREDENTIALS || path.resolve(here, '../credentials.json')) {
-  // GDRIVE_CREDENTIALS may be a path (local) or the inline JSON (Vercel env).
-  const raw = file.trimStart().startsWith('{') ? JSON.parse(file) : JSON.parse(await fs.readFile(file, 'utf8'));
-  const cfg = raw.installed || raw.web;
-  if (!cfg?.client_id || !cfg?.client_secret || !Array.isArray(cfg.redirect_uris)) {
-    throw new Error('credentials must contain an installed or web OAuth client');
+// Precedence: inline JSON (GDRIVE_CREDENTIALS) -> client id/secret env
+// parts -> the credentials.json file next to this repo. Serverless platforms
+// have no credentials.json and no D:/ paths, so the env paths matter there;
+// a missing or bad value must degrade, never crash the boot.
+export async function readInstalledCredentials(file = process.env.GDRIVE_CREDENTIALS || defaultCredentialsFile()) {
+  if (file) {
+    const raw = file.trimStart().startsWith('{') ? JSON.parse(file) : JSON.parse(await fs.readFile(file, 'utf8'));
+    const cfg = raw.installed || raw.web;
+    if (cfg?.client_id && cfg?.client_secret) return { ...cfg, redirect_uris: cfg.redirect_uris || [] };
+    throw new Error('GDRIVE_CREDENTIALS must contain an installed or web OAuth client');
   }
-  return cfg;
+  const { GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET } = process.env;
+  if (GDRIVE_CLIENT_ID && GDRIVE_CLIENT_SECRET) {
+    return { client_id: GDRIVE_CLIENT_ID, client_secret: GDRIVE_CLIENT_SECRET, redirect_uris: [] };
+  }
+  throw new Error('drive_not_configured');
+}
+
+function defaultCredentialsFile() {
+  return process.env.GDRIVE_CREDENTIALS_PATH || path.resolve(here, '../credentials.json');
+}
+
+// Same surface as a live session, but every Drive call fails with 428. Lets
+// /health, register/login and per-user routes stay up when the OAuth client
+// (or its token) is missing on a deployment.
+export function createDisabledDrive(reason = 'drive_not_configured') {
+  const notConfigured = () => {
+    const error = new Error(reason);
+    error.status = 428;
+    throw error;
+  };
+  return {
+    configured: false,
+    get authorized() { return false; },
+    authorizationUrl: notConfigured,
+    complete: notConfigured,
+    listTracks: notConfigured,
+    openFile: notConfigured,
+    coverArt: notConfigured,
+  };
 }
 
 // Token persistence. Vercel's filesystem is read-only except /tmp and resets
@@ -58,6 +90,7 @@ export async function createDriveSession({ credentials, redirectUri }) {
   const drive = google.drive({ version: 'v3', auth: oauth });
   return {
     oauth,
+    configured: true,
     get authorized() { return Boolean(tokens?.refresh_token || tokens?.access_token); },
     authorizationUrl(state) {
       return oauth.generateAuthUrl({ access_type: 'offline', prompt: 'consent', scope: scopes, state });

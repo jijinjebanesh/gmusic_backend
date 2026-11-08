@@ -43,9 +43,18 @@ private-profile firewall rule (do not expose the port to the internet).
 3. In Google Cloud Console → Credentials → your OAuth 2.0 client, add the
    Vercel deployment URL (`https://<project>.vercel.app/`) to **Authorized
    redirect URIs**.
-4. Connect Drive once from the app: the OAuth callback lands on the Vercel
+4. Open the app → connect Drive once: the OAuth callback lands on the Vercel
    URL and the token is stored in Atlas (`gdrive_tokens`), so it survives cold
    starts and redeploys.
+
+Two gotchas that produce the `ENOENT ... open 'D:/jaip/credentials.json'`
+boot crash, if env vars are set to local PC values:
+
+- `GDRIVE_CREDENTIALS` / `GDRIVE_TOKEN_JSON` must hold the **file contents**
+  (inline JSON), not a filesystem path.
+- Atlas → Network Access must include `0.0.0.0/0` (Vercel's serverless egress
+  IPs are dynamic); a single-IP allowlist that worked from the PC will refuse
+  the deployment.
 
 ### Environment variables
 
@@ -54,8 +63,8 @@ private-profile firewall rule (do not expose the port to the internet).
 | `MORNYE_API_TOKEN` | yes | ≥32 random chars; owner-token fallback + HMAC key for OAuth state |
 | `MONGO_URI` | yes | Atlas URI (see note below); drives login + token storage |
 | `MONGO_DB` | no | defaults to `Gmusic` |
-| `GDRIVE_CREDENTIALS` | yes | inline JSON of the OAuth client (`{"installed":{...}}`) — the repo deliberately ships no `credentials.json` |
-| `GDRIVE_TOKEN_JSON` | no | pre-authorized token JSON; skips the in-app OAuth step on first deploy |
+| `GDRIVE_CREDENTIALS` | yes | inline JSON of the OAuth client (`{"installed":{...}}`) — paste the file *contents*, never a path. A Windows path like `D:/jaip/credentials.json` exists only on the PC and crashes boot on a serverless host. With no credentials the service still boots (login works); Drive routes answer 428 `google_drive_not_connected` until it is set. |
+| `GDRIVE_TOKEN_JSON` | no | pre-authorized token JSON (contents of the local `data/token.json`); skips the in-app OAuth step on first deploy. Without it, complete Drive auth once from the app against the Vercel redirect URI. |
 | `GDRIVE_REDIRECT_URI` | no | defaults to `https://$VERCEL_URL/` on Vercel, `http://localhost:43821/` locally |
 
 To seed `GDRIVE_TOKEN_JSON` from a working local bridge:

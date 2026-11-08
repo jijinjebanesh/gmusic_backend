@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import express from 'express';
 import helmet from 'helmet';
 import pinoHttp from 'pino-http';
-import { readInstalledCredentials, createDriveSession } from './drive.js';
+import { readInstalledCredentials, createDriveSession, createDisabledDrive } from './drive.js';
 import { initDb, mongoEnabled, closeDb } from './db.js';
 import { authRoutes, userDataRoutes, attachUser } from './auth.js';
 
@@ -33,8 +33,18 @@ const signedStreamTickets = new Map();
 // MongoDB is optional: with MONGO_URI set the bridge runs user login +
 // per-user features; without it, the single-owner MORNYE_API_TOKEN path.
 if (process.env.MONGO_URI) await initDb();
-const credentials = await readInstalledCredentials();
-const drive = await createDriveSession({ credentials, redirectUri });
+// Drive is optional at boot: with no OAuth client configured the service
+// still serves /health, account login and per-user data; Drive routes answer
+// 428 until credentials exist. A Windows path like D:/jaip/credentials.json
+// only resolves on the PC, never on a serverless host.
+let drive;
+try {
+  const credentials = await readInstalledCredentials();
+  drive = await createDriveSession({ credentials, redirectUri });
+} catch (err) {
+  console.error(`Drive credentials unavailable (${err.message}) — Drive routes return 428 until configured`);
+  drive = createDisabledDrive(String(err.message));
+}
 // Absolute stream/art URLs: trust Vercel's forwarding headers, else loopback.
 function publicOrigin(req) {
   const proto = req.get('x-forwarded-proto') || req.protocol || 'http';
@@ -61,9 +71,10 @@ function verifyState(state) {
 app.get('/health', (_req, res) => res.json({
   ok: true,
   service: 'mornye-gdrive-bridge',
-  version: '0.3.0',
+  version: '0.3.1',
   runtime: onVercel ? 'vercel' : 'local',
   authMode: mongoEnabled() ? 'user_login' : 'token',
+  drive: drive.configured === false ? 'not_configured' : drive.authorized ? 'authorized' : 'not_authorized',
 }));
 // Public: account registration and login live here.
 app.use('/api/v1/auth', authRoutes);
@@ -151,8 +162,10 @@ app.get('/api/v1/tracks/:id/stream', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 app.use((err, _req, res, _next) => {
-  const status = err?.response?.status === 404 ? 404 : err?.response?.status === 401 ? 401 : 502;
-  res.status(status).json({ error: status === 404 ? 'drive_file_not_found' : 'drive_request_failed' });
+  const upstream = err?.response?.status;
+  const status = err?.status || (upstream === 404 ? 404 : upstream === 401 ? 401 : 502);
+  const error = status === 404 ? 'drive_file_not_found' : status === 428 ? 'google_drive_not_connected' : 'drive_request_failed';
+  res.status(status).json({ error });
 });
 // Local run: this process owns the port. Under Vercel the exported app below
 // is the request handler instead (a listening server would fail to boot).

@@ -1,0 +1,24 @@
+{
+  "name": "mornye-gdrive-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local Google Drive streaming bridge for Mornye beta",
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file=.env src/server.js",
+    "dev": "node --env-file=.env --watch src/server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": "22.x"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "express": "^5.1.0",
+    "googleapis": "^189.0.0",
+    "helmet": "^8.1.0",
+    "mongodb": "^6.22.0",
+    "pino": "^9.7.0",
+    "pino-http": "^10.5.0"
+  }
+}

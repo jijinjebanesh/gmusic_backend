@@ -1,0 +1,9 @@
+# Secrets and local state stay off GitHub
+node_modules/
+.env
+.env.*
+credentials.json
+data/token.json
+*.log
+.vercel
+.DS_Store

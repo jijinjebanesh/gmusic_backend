@@ -29,7 +29,28 @@ const onVercel = Boolean(process.env.VERCEL);
 // the Google client's authorized redirect URIs); locally it stays loopback.
 const redirectUri = process.env.GDRIVE_REDIRECT_URI
   || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}/` : `http://localhost:${port}/`);
-const signedStreamTickets = new Map();
+// Stream/art tickets are stateless: the file id and expiry are signed with
+// the API token. In-memory tickets break on serverless — one instance mints
+// the ticket, a different (or recycled) instance serves /stream, and the
+// player then hangs on a ticket that will never resolve.
+function signTicket(fileId, expiresAt) {
+  const payload = Buffer.from(JSON.stringify({ id: fileId, exp: expiresAt })).toString('base64url');
+  const mac = crypto.createHmac('sha256', apiToken).update(payload).digest('base64url');
+  return `${payload}.${mac}`;
+}
+function readTicket(ticket) {
+  const [payload, mac] = String(ticket || '').split('.');
+  if (!payload || !mac) return null;
+  const expected = Buffer.from(crypto.createHmac('sha256', apiToken).update(payload).digest('base64url'));
+  const given = Buffer.from(mac);
+  if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
+  try {
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
+    return data?.id && data.exp >= Date.now() ? data.id : null;
+  } catch {
+    return null;
+  }
+}
 // MongoDB is optional: with MONGO_URI set the bridge runs user login +
 // per-user features; without it, the single-owner MORNYE_API_TOKEN path.
 if (process.env.MONGO_URI) await initDb();
@@ -105,24 +126,22 @@ app.get('/api/v1/tracks', async (req, res, next) => {
     if (!drive.authorized) return res.status(428).json({ error: 'google_drive_not_connected' });
     const page = await drive.listTracks({ query: String(req.query.q || ''), pageToken: req.query.pageToken ? String(req.query.pageToken) : undefined, pageSize: req.query.pageSize });
     const expiresAt = Date.now() + 8 * 60 * 60_000;
-    const files = page.files.map((file) => {
-      const ticket = crypto.randomBytes(32).toString('base64url');
-      signedStreamTickets.set(ticket, { id: file.id, expiresAt });
-      return { ...file, streamUrl: `${publicOrigin(req)}/stream/${ticket}` };
-    });
-    for (const [key, value] of signedStreamTickets) if (value.expiresAt < Date.now()) signedStreamTickets.delete(key);
+    const files = page.files.map((file) => ({
+      ...file,
+      streamUrl: `${publicOrigin(req)}/stream/${signTicket(file.id, expiresAt)}`,
+    }));
     res.json({ ...page, files });
   } catch (err) { next(err); }
 });
 // Embedded cover art from the head of the file (ID3v2/FLAC/MP4). The
 // ticket-gated form needs no Authorization header, so it works in a browser
 // <img> (which cannot carry one). Returns 404 when no artwork is embedded.
-function artHandler(tickets, driveSession) {
+function artHandler(driveSession) {
   return async (req, res, next) => {
     try {
-      const entry = tickets.get(req.params.ticket);
-      if (!entry || entry.expiresAt < Date.now()) return res.status(401).end();
-      const art = await driveSession.coverArt(entry.id);
+      const fileId = readTicket(req.params.ticket);
+      if (!fileId) return res.status(401).end();
+      const art = await driveSession.coverArt(fileId);
       if (!art) return res.status(404).end();
       res.setHeader('content-type', art.contentType);
       res.setHeader('cache-control', 'private, max-age=86400');
@@ -130,7 +149,7 @@ function artHandler(tickets, driveSession) {
     } catch (err) { next(err); }
   };
 }
-app.get('/art/:ticket', artHandler(signedStreamTickets, drive));
+app.get('/art/:ticket', artHandler(drive));
 app.get('/api/v1/art/:id', async (req, res, next) => {
   try {
     if (!drive.authorized) return res.status(428).json({ error: 'google_drive_not_connected' });
@@ -144,10 +163,10 @@ app.get('/api/v1/art/:id', async (req, res, next) => {
 // A ticket grants short-lived access to one file and is safe to pass to the
 // audio engine; it never exposes the Google OAuth token or backend API token.
 app.get('/stream/:ticket', async (req, res, next) => {
-  const entry = signedStreamTickets.get(req.params.ticket);
-  if (!entry || entry.expiresAt < Date.now()) return res.status(401).end();
+  const fileId = readTicket(req.params.ticket);
+  if (!fileId) return res.status(401).end();
   try {
-    const result = await drive.openFile(entry.id, req.get('range'));
+    const result = await drive.openFile(fileId, req.get('range'));
     res.status(result.status);
     for (const [key, value] of Object.entries(result.headers)) res.setHeader(key, value);
     result.stream.on('error', next);

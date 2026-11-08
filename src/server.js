@@ -38,12 +38,14 @@ if (process.env.MONGO_URI) await initDb();
 // 428 until credentials exist. A Windows path like D:/jaip/credentials.json
 // only resolves on the PC, never on a serverless host.
 let drive;
+let driveReason = null;
 try {
   const credentials = await readInstalledCredentials();
   drive = await createDriveSession({ credentials, redirectUri });
 } catch (err) {
-  console.error(`Drive credentials unavailable (${err.message}) — Drive routes return 428 until configured`);
-  drive = createDisabledDrive(String(err.message));
+  driveReason = String(err.message);
+  console.error(`Drive credentials unavailable (${driveReason}) — Drive routes return 428 until configured`);
+  drive = createDisabledDrive(driveReason);
 }
 // Absolute stream/art URLs: trust Vercel's forwarding headers, else loopback.
 function publicOrigin(req) {
@@ -75,6 +77,7 @@ app.get('/health', (_req, res) => res.json({
   runtime: onVercel ? 'vercel' : 'local',
   authMode: mongoEnabled() ? 'user_login' : 'token',
   drive: drive.configured === false ? 'not_configured' : drive.authorized ? 'authorized' : 'not_authorized',
+  ...(driveReason ? { driveReason } : {}),
 }));
 // Public: account registration and login live here.
 app.use('/api/v1/auth', authRoutes);

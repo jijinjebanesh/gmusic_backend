@@ -8,7 +8,7 @@ import { ObjectId } from 'mongodb';
 import { col, mongoEnabled } from './db.js';
 
 const SESSION_DAYS = 30;
-const EMAIL_RE = /^[^\s@]+@[^\s@]+**\\.**[^\s@]+$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const tokenHash = (token) => crypto.createHash('sha256').update(token).digest('hex');
 const userIdOf = (user) => String(user._id);

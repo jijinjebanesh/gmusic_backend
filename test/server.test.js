@@ -28,6 +28,13 @@ test('health is public and API requires bearer authentication', async () => {
     }
     assert.equal(health?.status, 200);
     assert.equal((await health.json()).ok, true);
+    const invalidJson = await fetch(`http://127.0.0.1:${port}/api/v1/auth/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{"email":"invalid@example.com","password":"password123" "displayName":"Test"}',
+    });
+    assert.equal(invalidJson.status, 400);
+    assert.deepEqual(await invalidJson.json(), { error: 'invalid_json' });
     assert.equal((await fetch(`http://127.0.0.1:${port}/api/v1/status`)).status, 401);
     const status = await fetch(`http://127.0.0.1:${port}/api/v1/status`, { headers: { authorization: `Bearer ${token}` } });
     assert.equal(status.status, 200);

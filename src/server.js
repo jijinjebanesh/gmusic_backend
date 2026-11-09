@@ -184,6 +184,9 @@ app.get('/api/v1/tracks/:id/stream', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 app.use((err, _req, res, _next) => {
+  if (err?.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'invalid_json' });
+  }
   const upstream = err?.response?.status;
   const status = err?.status || (upstream === 404 ? 404 : upstream === 401 ? 401 : 502);
   const error = status === 404 ? 'drive_file_not_found' : status === 428 ? 'google_drive_not_connected' : 'drive_request_failed';

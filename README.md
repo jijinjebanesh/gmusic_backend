@@ -68,8 +68,9 @@ private-profile firewall rule (do not expose the port to the internet).
    **Other** — `api/index.js` is detected automatically).
 2. Add the environment variables below (Settings → Environment Variables).
 3. In Google Cloud Console → Credentials → your OAuth 2.0 client, add
-   `https://<project>.vercel.app/` to **Authorized redirect URIs** (or the
-   exact `GDRIVE_REDIRECT_URI` value).
+   `https://gmusicbackend.vercel.app/` to **Authorized redirect URIs** (or the
+   exact `GDRIVE_REDIRECT_URI` value). The backend uses Vercel's stable
+   production domain by default, not a deployment-specific preview URL.
 4. Connect the common Google Drive account once from GMusic Settings. The
    backend stores its OAuth token centrally; every signed-in GMusic account
    browses the same indexed catalog.
@@ -93,10 +94,10 @@ boot crash, if env vars are set to local PC values:
 | `MONGO_DB` | no | defaults to `Gmusic` |
 | `GDRIVE_CREDENTIALS` | yes | inline JSON of the OAuth client (`{"installed":{...}}`) — paste the file *contents*, never a path. A Windows path like `D:/jaip/credentials.json` exists only on the PC and crashes boot on a serverless host. With no credentials the service still boots (login works); Drive routes answer 428 `google_drive_not_connected` until it is set. |
 | `GMUSIC_DRIVE_MODE` | no | defaults to `shared`; set exactly to `per_user` only when each GMusic account must connect a separate Drive |
-| `GDRIVE_REDIRECT_URI` | no | common-Drive callback; defaults to `https://$VERCEL_URL/` on Vercel or `http://localhost:43821/` locally |
+| `GDRIVE_REDIRECT_URI` | no | common-Drive callback; defaults to `https://$VERCEL_PROJECT_PRODUCTION_URL/` on Vercel (falls back to `VERCEL_URL`) or `http://localhost:43821/` locally |
 | `GDRIVE_TOKEN_JSON` | no | optional pre-authorized common-Drive token JSON; otherwise authorize the shared Drive once in Settings |
 | `GDRIVE_TOKEN_ENCRYPTION_KEY` | per-user mode only | 32 random bytes encoded as base64 or 64 hex characters; stable and private, changing it requires each user to reconnect |
-| `GDRIVE_USER_REDIRECT_URI` | per-user mode only | defaults to `https://$VERCEL_URL/api/v1/drive/oauth/callback` on Vercel or `http://localhost:43821/api/v1/drive/oauth/callback` locally; register this exact URL with Google |
+| `GDRIVE_USER_REDIRECT_URI` | per-user mode only | defaults to `https://$VERCEL_PROJECT_PRODUCTION_URL/api/v1/drive/oauth/callback` on Vercel (falls back to `VERCEL_URL`) or `http://localhost:43821/api/v1/drive/oauth/callback` locally; register this exact URL with Google |
 
 Do not print or paste OAuth tokens or the encryption key into logs, shell
 history, chat, or source control.

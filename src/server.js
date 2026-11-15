@@ -20,6 +20,7 @@ import {
   listTracks,
 } from './catalog.js';
 import { getDriveIndexStatus, syncDriveBatch } from './indexer.js';
+import { resolveOAuthRedirectUri } from './oauth_redirect_uri.js';
 
 const app = express();
 app.disable('x-powered-by');
@@ -55,14 +56,22 @@ if (!apiToken || apiToken.length < 32) throw new Error('Set MORNYE_API_TOKEN to 
 const port = Number(process.env.PORT || 43821);
 const onVercel = Boolean(process.env.VERCEL);
 const driveMode = process.env.GMUSIC_DRIVE_MODE === 'per_user' ? 'per_user' : 'shared';
-// On Vercel the OAuth callback must be the public deployment URL (add it to
-// the Google client's authorized redirect URIs); locally it stays loopback.
-const redirectUri = process.env.GDRIVE_REDIRECT_URI
-  || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}/` : `http://localhost:${port}/`);
-const userRedirectUri = process.env.GDRIVE_USER_REDIRECT_URI
-  || (process.env.VERCEL_URL
-    ? `https://${process.env.VERCEL_URL}/api/v1/drive/oauth/callback`
-    : `http://localhost:${port}/api/v1/drive/oauth/callback`);
+// Prefer Vercel's stable production domain over its per-deployment URL.
+const redirectOptions = {
+  projectProductionUrl: process.env.VERCEL_PROJECT_PRODUCTION_URL,
+  deploymentUrl: process.env.VERCEL_URL,
+  localUrl: `http://localhost:${port}/`,
+};
+const redirectUri = resolveOAuthRedirectUri({
+  ...redirectOptions,
+  override: process.env.GDRIVE_REDIRECT_URI,
+  path: '/',
+});
+const userRedirectUri = resolveOAuthRedirectUri({
+  ...redirectOptions,
+  override: process.env.GDRIVE_USER_REDIRECT_URI,
+  path: '/api/v1/drive/oauth/callback',
+});
 // Stream/art tickets are stateless: the file id and expiry are signed with
 // the API token. In-memory tickets break on serverless — one instance mints
 // the ticket, a different (or recycled) instance serves /stream, and the

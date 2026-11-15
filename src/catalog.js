@@ -217,6 +217,17 @@ export async function getTrack(id, ownerId = SHARED_OWNER_ID) {
   return doc ? trackForApi(doc) : null;
 }
 
+export async function getTrackLyrics(id, ownerId = SHARED_OWNER_ID) {
+  const documentId = ownerId === SHARED_OWNER_ID ? id : `${ownerId}:${id}`;
+  const doc = await col('drive_tracks').findOne(
+    ownerQuery({ _id: documentId, availability: 'available' }, ownerId),
+    { projection: { lyrics: 1 } },
+  );
+  return typeof doc?.lyrics === 'string' && doc.lyrics.trim()
+    ? doc.lyrics
+    : null;
+}
+
 function trackForApi(doc) {
   return {
     id: doc.driveFileId,

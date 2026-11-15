@@ -14,6 +14,7 @@ import {
   getAlbum,
   getArtist,
   getTrack,
+  getTrackLyrics,
   genreTracks,
   listAlbums,
   listArtists,
@@ -326,6 +327,13 @@ app.get('/api/v1/catalog/tracks/:id', async (req, res, next) => {
     const track = await getTrack(req.params.id, driveOwner(req));
     if (!track) return res.status(404).json({ error: 'track_not_found' });
     res.json({ track: withStreamUrl(req, track) });
+  } catch (error) { next(error); }
+});
+app.get('/api/v1/catalog/tracks/:id/lyrics', async (req, res, next) => {
+  try {
+    const lyrics = await getTrackLyrics(req.params.id, driveOwner(req));
+    if (lyrics === null) return res.status(404).json({ error: 'lyrics_not_found' });
+    res.json({ lyrics });
   } catch (error) { next(error); }
 });
 app.get('/api/v1/artists', async (req, res, next) => {

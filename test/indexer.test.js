@@ -62,7 +62,7 @@ class MemoryDatabase {
   }
 }
 
-function trackStream(title) {
+function trackStream(title, lyrics = '') {
   const text = Buffer.from(title);
   const data = Buffer.concat([Buffer.from([0]), text]);
   const frame = Buffer.alloc(10);
@@ -72,7 +72,23 @@ function trackStream(title) {
   const artistFrame = Buffer.alloc(10);
   artistFrame.write('TPE1', 0, 'ascii');
   artistFrame.writeUInt32BE(artist.length, 4);
-  const body = Buffer.concat([frame, data, artistFrame, artist]);
+  const lyricsText = Buffer.from(lyrics);
+  const lyricsData = Buffer.concat([
+    Buffer.from([0]),
+    Buffer.from('eng'),
+    Buffer.from([0]),
+    lyricsText,
+  ]);
+  const lyricsFrame = Buffer.alloc(10);
+  lyricsFrame.write('USLT', 0, 'ascii');
+  lyricsFrame.writeUInt32BE(lyricsData.length, 4);
+  const body = Buffer.concat([
+    frame,
+    data,
+    artistFrame,
+    artist,
+    ...(lyrics ? [lyricsFrame, lyricsData] : []),
+  ]);
   const size = Buffer.from([
     (body.length >> 21) & 0x7f,
     (body.length >> 14) & 0x7f,
@@ -86,6 +102,42 @@ function trackStream(title) {
   stream.end(Buffer.concat([header, body, audio]));
   return stream;
 }
+
+test('indexing stores embedded lyrics and upgrades older metadata records', async () => {
+  const database = new MemoryDatabase();
+  const collection = (name) => database.collection(name);
+  const file = {
+    id: 'drive-lyrics',
+    name: 'Lyrics.mp3',
+    mimeType: 'audio/mpeg',
+    size: '1048576',
+    modifiedTime: '1',
+    md5Checksum: 'lyrics',
+  };
+  const tracks = collection('drive_tracks');
+  tracks.documents.set(file.id, {
+    _id: file.id,
+    modifiedTime: file.modifiedTime,
+    md5Checksum: file.md5Checksum,
+    metadataStatus: 'indexed',
+    metadataVersion: 1,
+  });
+  let opened = false;
+  const drive = {
+    async getStartPageToken() { return 'change-1'; },
+    async listAudioCandidates() { return { files: [file], nextPageToken: null }; },
+    async openFile() {
+      opened = true;
+      return { stream: trackStream('Lyrics', 'First line\nSecond line') };
+    },
+  };
+
+  await syncDriveBatch(drive, { collection, isMongoEnabled: () => true });
+  const indexed = tracks.documents.get(file.id);
+  assert.equal(opened, true);
+  assert.equal(indexed.lyrics, 'First line\nSecond line');
+  assert.equal(indexed.metadataVersion, 2);
+});
 
 test('full indexing resumes between pages, then incremental changes update and remove tracks', async () => {
   const database = new MemoryDatabase();

@@ -23,6 +23,7 @@ OAuth client secret anywhere but this service.
 | `GET /api/v1/drive/status` · `GET /api/v1/drive/sync/status` | Drive authorization and persistent index status |
 | `POST /api/v1/drive/sync` | Runs one bounded full-index or incremental-change batch |
 | `GET /api/v1/catalog/tracks` · `GET /api/v1/catalog/tracks/:id` | Paginated indexed tracks with normalized tags and stream tickets |
+| `GET /api/v1/catalog/tracks/:id/lyrics` | Embedded lyrics from indexed audio tags; returns `lyrics_not_found` when absent |
 | `GET /api/v1/artists` · `GET /api/v1/artists/:id/*` | Indexed artist aggregates, tracks and albums |
 | `GET /api/v1/albums` · `GET /api/v1/albums/:id/*` | Indexed album aggregates and ordered tracks |
 | `GET /api/v1/genres` · `GET /api/v1/genres/:id/tracks` | Indexed genres and matching tracks |

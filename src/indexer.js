@@ -7,6 +7,8 @@ const TRACKS_COLLECTION = 'drive_tracks';
 const SHARED_OWNER_ID = 'shared';
 const PAGE_SIZE = 8;
 const MAX_METADATA_ALLOCATION = 4 * 1024 * 1024;
+const MAX_LYRICS_LENGTH = 64_000;
+const METADATA_VERSION = 2;
 
 function stateId(ownerId) {
   return ownerId === SHARED_OWNER_ID ? 'primary' : String(ownerId);
@@ -37,6 +39,23 @@ export async function extractAudioMetadata(stream, file) {
       maxMemoryAllocation: MAX_METADATA_ALLOCATION,
     },
   );
+}
+
+function embeddedLyrics(tags) {
+  const entries = Array.isArray(tags?.lyrics) ? tags.lyrics : [];
+  const text = entries
+    .map((entry) => {
+      if (typeof entry === 'string') return entry.trim();
+      const synchronized = Array.isArray(entry?.syncText)
+        ? entry.syncText.map((line) => String(line?.text || '')).filter(Boolean)
+        : [];
+      return (synchronized.length ? synchronized.join('\n') : String(entry?.text || '')).trim();
+    })
+    .filter(Boolean)
+    .join('\n\n')
+    .slice(0, MAX_LYRICS_LENGTH)
+    .trim();
+  return text || null;
 }
 
 function safeError(error) {
@@ -118,9 +137,10 @@ async function indexFile(drive, file, scanId, collection = col, ownerId = SHARED
   const documentId = trackId(ownerId, file.id);
   const existing = await tracks.findOne(
     { _id: documentId },
-    { projection: { modifiedTime: 1, md5Checksum: 1, availability: 1, metadataStatus: 1 } },
+    { projection: { modifiedTime: 1, md5Checksum: 1, availability: 1, metadataStatus: 1, metadataVersion: 1 } },
   );
   const unchanged = existing && existing.metadataStatus !== 'partial' &&
+    existing.metadataVersion === METADATA_VERSION &&
     existing.modifiedTime === (file.modifiedTime || null) &&
     existing.md5Checksum === (file.md5Checksum || null);
   if (unchanged) {
@@ -163,6 +183,8 @@ async function indexFile(drive, file, scanId, collection = col, ownerId = SHARED
     owners: file.owners || [],
     artistKeys: metadata.artistEntries.map((artist) => artist.key),
     ...metadata,
+    lyrics: embeddedLyrics(tags),
+    metadataVersion: METADATA_VERSION,
     metadataStatus,
     metadataError,
     availability: 'available',

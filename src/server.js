@@ -5,6 +5,7 @@ import pinoHttp from 'pino-http';
 import { readInstalledCredentials, createDriveSession, createDisabledDrive } from './drive.js';
 import { col, initDb, mongoEnabled } from './db.js';
 import { authRoutes, userDataRoutes, attachUser } from './auth.js';
+import { playbackRoutes } from './playback.js';
 import { createDriveConnectionService } from './drive_connections.js';
 import { apiErrorCode } from './api_error_code.js';
 import {
@@ -14,6 +15,7 @@ import {
   getAlbum,
   getArtist,
   getTrack,
+  getTracksByIds,
   getTrackLyrics,
   genreTracks,
   listAlbums,
@@ -41,7 +43,7 @@ function allowCrossOriginMedia(_req, res, next) {
   res.setHeader('cross-origin-resource-policy', 'cross-origin');
   next();
 }
-app.use(express.json({ limit: '32kb' }));
+app.use(express.json({ limit: '64kb' }));
 app.use(pinoHttp({
   redact: ['req.headers.authorization'],
   autoLogging: {
@@ -209,6 +211,7 @@ app.get('/api/v1/drive/oauth/callback', async (req, res) => {
 // Everything else under /api/v1 requires a session token (or the owner token).
 app.use('/api/v1', attachUser(apiToken));
 app.use('/api/v1', userDataRoutes);
+app.use('/api/v1', playbackRoutes);
 app.get('/api/v1/status', async (req, res, next) => {
   try {
     const connection = driveMode === 'shared'
@@ -320,6 +323,17 @@ app.get('/api/v1/catalog/tracks', async (req, res, next) => {
       ownerId: driveOwner(req),
     });
     res.json({ ...page, files: page.files.map((track) => withStreamUrl(req, track)) });
+  } catch (error) { next(error); }
+});
+app.post('/api/v1/catalog/tracks/resolve', async (req, res, next) => {
+  try {
+    const ids = req.body?.trackIds;
+    if (!Array.isArray(ids) || ids.length > 500 ||
+        ids.some((id) => typeof id !== 'string' || id.length === 0 || id.length > 256)) {
+      return res.status(400).json({ error: 'invalid_track_ids' });
+    }
+    const tracks = await getTracksByIds(ids, driveOwner(req));
+    res.json({ files: tracks.map((track) => withStreamUrl(req, track)) });
   } catch (error) { next(error); }
 });
 app.get('/api/v1/catalog/tracks/:id', async (req, res, next) => {

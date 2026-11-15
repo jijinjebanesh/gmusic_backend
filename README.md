@@ -23,7 +23,11 @@ OAuth client secret anywhere but this service.
 | `GET /api/v1/drive/status` · `GET /api/v1/drive/sync/status` | Drive authorization and persistent index status |
 | `POST /api/v1/drive/sync` | Runs one bounded full-index or incremental-change batch |
 | `GET /api/v1/catalog/tracks` · `GET /api/v1/catalog/tracks/:id` | Paginated indexed tracks with normalized tags and stream tickets |
+| `POST /api/v1/catalog/tracks/resolve` | Resolves up to 500 track IDs for playback handoff |
 | `GET /api/v1/catalog/tracks/:id/lyrics` | Embedded lyrics from indexed audio tags; returns `lyrics_not_found` when absent |
+| `GET /api/v1/playback/state` · `POST /api/v1/playback/poll` | Account-scoped connected devices and the active playback session |
+| `POST /api/v1/playback/handoff` · `POST /api/v1/playback/commands` | Transfers playback or queues a command for the active device |
+| `POST /api/v1/playback/commands/:commandId/ack` | Acknowledges remote command execution |
 | `GET /api/v1/artists` · `GET /api/v1/artists/:id/*` | Indexed artist aggregates, tracks and albums |
 | `GET /api/v1/albums` · `GET /api/v1/albums/:id/*` | Indexed album aggregates and ordered tracks |
 | `GET /api/v1/genres` · `GET /api/v1/genres/:id/tracks` | Indexed genres and matching tracks |
@@ -46,6 +50,12 @@ encrypted token persistence are only required in optional per-user Drive mode.
 The OAuth callback is the only public `/api/v1` exception beyond `auth/*`; it
 accepts only a valid, database-backed, one-use state bound to the initiating
 user.
+
+Connected playback requires a signed-in personal account; owner-token mode is
+not accepted. Active devices heartbeat every two seconds and are considered
+offline after 20 seconds without a poll. Handoff transfers the queue and
+playback position, and the receiving device resolves track IDs into fresh
+stream tickets. Queues are capped at 500 tracks.
 
 Ticketed and authenticated media routes allow cross-origin resource loading so
 the Flutter web app can play audio and display artwork from a separate local

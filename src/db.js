@@ -72,6 +72,15 @@ async function ensureIndexes() {
   await db.collection('drive_oauth_states').createIndex({ stateHash: 1 }, { unique: true });
   await db.collection('drive_oauth_states').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
   await db.collection('drive_oauth_states').createIndex({ userId: 1 });
+  await db.collection('playback_devices').createIndex(
+    { userId: 1, deviceId: 1 },
+    { unique: true },
+  );
+  await db.collection('playback_devices').createIndex({ userId: 1, lastSeenAt: -1 });
+  await db.collection('playback_sessions').createIndex({ userId: 1 }, { unique: true });
+  const playbackCommands = db.collection('playback_commands');
+  await playbackCommands.createIndex({ userId: 1, deviceId: 1, status: 1, createdAt: 1 });
+  await playbackCommands.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 }
 
 export async function closeDb() {

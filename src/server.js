@@ -6,6 +6,7 @@ import { readInstalledCredentials, createDriveSession, createDisabledDrive } fro
 import { col, initDb, mongoEnabled } from './db.js';
 import { authRoutes, userDataRoutes, attachUser } from './auth.js';
 import { createDriveConnectionService } from './drive_connections.js';
+import { apiErrorCode } from './api_error_code.js';
 import {
   albumTracks,
   artistAlbums,
@@ -476,7 +477,7 @@ app.use((err, _req, res, _next) => {
   }
   const upstream = err?.response?.status;
   const status = err?.status || (upstream === 404 ? 404 : upstream === 401 ? 401 : 502);
-  const error = err?.code || (
+  const error = apiErrorCode(err) || (
     status === 404 ? 'drive_file_not_found' :
       status === 428 ? 'google_drive_not_connected' :
         status === 503 ? 'mongo_unavailable' :

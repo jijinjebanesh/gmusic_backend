@@ -53,33 +53,45 @@ export function createDisabledDrive(reason = 'drive_not_configured') {
   };
 }
 
-// Token persistence. Vercel's filesystem is read-only except /tmp and resets
-// every cold start, so tokens live in Atlas when Mongo is on; the file stays
-// the local-bridge store. GDRIVE_TOKEN_JSON pre-seeds an already-authorized
-// token without any OAuth round-trip (paste the local data/token.json once).
-async function loadTokens() {
-  if (process.env.GDRIVE_TOKEN_JSON) {
-    try { return JSON.parse(process.env.GDRIVE_TOKEN_JSON); } catch { /* fall through */ }
+// Vercel's filesystem is read-only except /tmp and resets every cold start, so
+// MongoDB is authoritative when enabled; the file is the local-bridge store.
+// GDRIVE_TOKEN_JSON pre-seeds an already-authorized token without OAuth.
+export async function loadSharedTokens({
+  inlineJson = process.env.GDRIVE_TOKEN_JSON,
+  isMongoEnabled = mongoEnabled,
+  getCollection = col,
+  tokenFilePath = tokenFile,
+  fileSystem = fs,
+} = {}) {
+  if (inlineJson) return JSON.parse(inlineJson);
+  if (isMongoEnabled()) {
+    const doc = await getCollection('gdrive_tokens').findOne({ _id: 'primary' });
+    if (doc?.tokens) return doc.tokens;
   }
   try {
-    if (mongoEnabled()) {
-      const doc = await col('gdrive_tokens').findOne({ _id: 'primary' });
-      if (doc?.tokens) return doc.tokens;
-    }
-  } catch { /* mongo optional */ }
-  try { return JSON.parse(await fs.readFile(tokenFile, 'utf8')); } catch { return null; }
+    return JSON.parse(await fileSystem.readFile(tokenFilePath, 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
-async function saveTokens(tokens) {
-  try {
-    if (mongoEnabled()) {
-      await col('gdrive_tokens').updateOne({ _id: 'primary' }, { $set: { tokens, updatedAt: new Date() } }, { upsert: true });
-    }
-  } catch { /* mongo optional */ }
-  try {
-    await fs.mkdir(path.dirname(tokenFile), { recursive: true });
-    await fs.writeFile(tokenFile, JSON.stringify(tokens, null, 2), { mode: 0o600 });
-  } catch { /* read-only filesystem (Vercel) — Mongo copy is authoritative */ }
+export async function persistSharedTokens(tokens, {
+  isMongoEnabled = mongoEnabled,
+  getCollection = col,
+  tokenFilePath = tokenFile,
+  fileSystem = fs,
+} = {}) {
+  if (isMongoEnabled()) {
+    await getCollection('gdrive_tokens').updateOne(
+      { _id: 'primary' },
+      { $set: { tokens, updatedAt: new Date() } },
+      { upsert: true },
+    );
+    return;
+  }
+  await fileSystem.mkdir(path.dirname(tokenFilePath), { recursive: true });
+  await fileSystem.writeFile(tokenFilePath, JSON.stringify(tokens, null, 2), { mode: 0o600 });
 }
 
 export async function createDriveSession({
@@ -89,9 +101,9 @@ export async function createDriveSession({
   persistTokens,
 }) {
   const oauth = new google.auth.OAuth2(credentials.client_id, credentials.client_secret, redirectUri);
-  let tokens = initialTokens || await loadTokens();
+  let tokens = initialTokens || await loadSharedTokens();
   let tokenPersistenceError = null;
-  const save = persistTokens || saveTokens;
+  const save = persistTokens || persistSharedTokens;
   if (tokens) oauth.setCredentials(tokens);
   oauth.on('tokens', (update) => {
     tokens = { ...tokens, ...update };

@@ -1,26 +1,22 @@
-// Try credential/authSource variants against Atlas and report what works.
+// Read-only connectivity probe. Configure MONGO_URI outside source control.
 import { MongoClient } from 'mongodb';
 
-const hosts = 'fertioptimizer-shard-00-00.gjsww.mongodb.net:27017,fertioptimizer-shard-00-01.gjsww.mongodb.net:27017,fertioptimizer-shard-00-02.gjsww.mongodb.net:27017';
-const passes = ['jijin2005', 'jijin2005.'];
-const authSources = ['admin', 'Gmusic'];
+if (!process.env.MONGO_URI) {
+  throw new Error('Set MONGO_URI in the environment before running this probe.');
+}
 
-for (const pass of passes) {
-  for (const authSource of authSources) {
-    const uri = `mongodb://jijin:${encodeURIComponent(pass)}@${hosts}/Gmusic?ssl=true&replicaSet=atlas-p5607u-shard-0&authSource=${authSource}&retryWrites=true&w=majority`;
-    const client = new MongoClient(uri, { serverSelectionTimeoutMS: 6000 });
-    try {
-      await client.connect();
-      const db = client.db('Gmusic');
-      const count = await db.collection('Users').countDocuments();
-      const sample = await db.collection('Users').findOne({});
-      console.log(`OK | authSource=${authSource} | passLen=${pass.length} | users=${count}`);
-      console.log('sample:', JSON.stringify(sample));
-      await client.close();
-      process.exit(0);
-    } catch (err) {
-      console.log(`FAIL | authSource=${authSource} | passLen=${pass.length} | ${err.message.slice(0, 60)}`);
-      await client.close().catch(() => {});
-    }
-  }
+const client = new MongoClient(process.env.MONGO_URI, {
+  serverSelectionTimeoutMS: 8000,
+});
+
+try {
+  await client.connect();
+  const db = client.db(process.env.MONGO_DB || 'Gmusic');
+  const names = await db.listCollections({}, { nameOnly: true }).toArray();
+  console.log(`MongoDB connection successful; ${names.length} collections found.`);
+} catch (error) {
+  console.error(`MongoDB connection failed: ${error.message}`);
+  process.exitCode = 1;
+} finally {
+  await client.close();
 }

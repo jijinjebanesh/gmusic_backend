@@ -45,6 +45,9 @@ export function createDisabledDrive(reason = 'drive_not_configured') {
     authorizationUrl: notConfigured,
     complete: notConfigured,
     listTracks: notConfigured,
+    listAudioCandidates: notConfigured,
+    getStartPageToken: notConfigured,
+    listChanges: notConfigured,
     openFile: notConfigured,
     coverArt: notConfigured,
   };
@@ -79,14 +82,28 @@ async function saveTokens(tokens) {
   } catch { /* read-only filesystem (Vercel) — Mongo copy is authoritative */ }
 }
 
-export async function createDriveSession({ credentials, redirectUri }) {
+export async function createDriveSession({
+  credentials,
+  redirectUri,
+  initialTokens,
+  persistTokens,
+}) {
   const oauth = new google.auth.OAuth2(credentials.client_id, credentials.client_secret, redirectUri);
-  let tokens = await loadTokens();
+  let tokens = initialTokens || await loadTokens();
+  let tokenPersistenceError = null;
+  const save = persistTokens || saveTokens;
   if (tokens) oauth.setCredentials(tokens);
-  oauth.on('tokens', async (update) => {
+  oauth.on('tokens', (update) => {
     tokens = { ...tokens, ...update };
-    await saveTokens(tokens);
+    tokenPersistenceError = null;
+    Promise.resolve(save(tokens)).catch((error) => {
+      tokenPersistenceError = error;
+      console.error(`Drive token persistence failed (${error.code || error.name || 'storage_error'})`);
+    });
   });
+  const assertTokenPersistence = () => {
+    if (tokenPersistenceError) throw tokenPersistenceError;
+  };
   const drive = google.drive({ version: 'v3', auth: oauth });
   return {
     oauth,
@@ -99,9 +116,10 @@ export async function createDriveSession({ credentials, redirectUri }) {
       const result = await oauth.getToken(code);
       tokens = result.tokens;
       oauth.setCredentials(tokens);
-      await saveTokens(tokens);
+      await save(tokens);
     },
     async listTracks({ query = '', pageToken, pageSize = 50 } = {}) {
+      assertTokenPersistence();
       const parts = ["trashed = false", "mimeType contains 'audio/'"];
       if (query.trim()) {
         const escaped = query.trim().replaceAll("'", "\\'");
@@ -109,14 +127,80 @@ export async function createDriveSession({ credentials, redirectUri }) {
       }
       const result = await drive.files.list({
         q: parts.join(' and '), pageSize: Math.min(Math.max(Number(pageSize) || 50, 1), 100),
-        pageToken, orderBy: 'name', fields: 'nextPageToken,files(id,name,mimeType,size,modifiedTime,thumbnailLink,webViewLink,description)',
+        pageToken, orderBy: 'name',         fields: 'nextPageToken,files(id,name,mimeType,size,modifiedTime,createdTime,md5Checksum,parents,owners(displayName,emailAddress),thumbnailLink,description)',
       });
       return { files: (result.data.files || []).map((f) => ({
         id: f.id, name: f.name, mimeType: f.mimeType, size: f.size || null,
         modifiedTime: f.modifiedTime || null, artworkUrl: f.thumbnailLink || null,
       })), nextPageToken: result.data.nextPageToken || null };
     },
+    async listAudioCandidates({ pageToken, pageSize = 8 } = {}) {
+      assertTokenPersistence();
+      // Drive's name-contains query matches prefixes, not suffixes such as
+      // ".mp3"; scan file metadata pages and filter supported audio locally.
+      const result = await drive.files.list({
+        q: "trashed = false and mimeType != 'application/vnd.google-apps.folder'",
+        pageSize: Math.min(Math.max(Number(pageSize) || 8, 1), 100),
+        pageToken,
+        orderBy: 'name',
+        fields: 'nextPageToken,files(id,name,mimeType,size,modifiedTime,createdTime,md5Checksum,parents,owners(displayName,emailAddress))',
+      });
+      return {
+        files: (result.data.files || []).map((file) => ({
+          id: file.id,
+          name: file.name,
+          mimeType: file.mimeType,
+          size: file.size || null,
+          modifiedTime: file.modifiedTime || null,
+          createdTime: file.createdTime || null,
+          md5Checksum: file.md5Checksum || null,
+          parentIds: file.parents || [],
+          owners: (file.owners || []).map(({ displayName, emailAddress }) => ({
+            displayName,
+            emailAddress,
+          })),
+        })),
+        nextPageToken: result.data.nextPageToken || null,
+      };
+    },
+    async getStartPageToken() {
+      assertTokenPersistence();
+      const result = await drive.changes.getStartPageToken({ fields: 'startPageToken' });
+      return result.data.startPageToken;
+    },
+    async listChanges({ pageToken, pageSize = 8 } = {}) {
+      assertTokenPersistence();
+      const result = await drive.changes.list({
+        pageToken,
+        pageSize: Math.min(Math.max(Number(pageSize) || 8, 1), 100),
+        fields: 'nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,size,modifiedTime,createdTime,md5Checksum,parents,owners(displayName,emailAddress),trashed))',
+      });
+      return {
+        changes: (result.data.changes || []).map((change) => ({
+          fileId: change.fileId,
+          removed: change.removed || false,
+          file: change.file ? {
+            id: change.file.id,
+            name: change.file.name,
+            mimeType: change.file.mimeType,
+            size: change.file.size || null,
+            modifiedTime: change.file.modifiedTime || null,
+            createdTime: change.file.createdTime || null,
+            md5Checksum: change.file.md5Checksum || null,
+            parentIds: change.file.parents || [],
+            owners: (change.file.owners || []).map(({ displayName, emailAddress }) => ({
+              displayName,
+              emailAddress,
+            })),
+            trashed: change.file.trashed || false,
+          } : null,
+        })),
+        nextPageToken: result.data.nextPageToken || null,
+        newStartPageToken: result.data.newStartPageToken || null,
+      };
+    },
     async openFile(id, range) {
+      assertTokenPersistence();
       const params = { fileId: id, alt: 'media' };
       const response = await drive.files.get(params, {
         responseType: 'stream',
@@ -128,6 +212,7 @@ export async function createDriveSession({ credentials, redirectUri }) {
       const contentRange = readHeader('content-range');
       const contentLength = readHeader('content-length');
       const contentType = readHeader('content-type');
+      const acceptRanges = readHeader('accept-ranges');
       return {
         stream: response.data,
         status: response.status || (range && contentRange ? 206 : 200),
@@ -135,7 +220,7 @@ export async function createDriveSession({ credentials, redirectUri }) {
           'content-type': contentType || 'application/octet-stream',
           ...(contentLength ? { 'content-length': contentLength } : {}),
           ...(contentRange ? { 'content-range': contentRange } : {}),
-          'accept-ranges': 'bytes',
+          ...(acceptRanges ? { 'accept-ranges': acceptRanges } : {}),
         },
       };
     },
@@ -143,6 +228,7 @@ export async function createDriveSession({ credentials, redirectUri }) {
     // tags embedded in the file itself. Only the first megabyte is fetched:
     // ID3v2 and FLAC metadata blocks live at the head of the file.
     async coverArt(id) {
+      assertTokenPersistence();
       const response = await drive.files.get({ fileId: id, alt: 'media' }, {
         responseType: 'stream',
         headers: { Range: 'bytes=0-1048575' },

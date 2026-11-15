@@ -16,10 +16,10 @@ export async function initDb() {
     console.log(`MongoDB connected: ${db.databaseName}`);
     return db;
   } catch (err) {
-    console.error(`MongoDB unavailable (${err.message}) — running in token-only mode; user login endpoints return 503`);
+    console.error(`MongoDB initialization failed (${err.name || 'connection error'}); refusing to start with an invalid configured database`);
     client = null;
     db = null;
-    return null;
+    throw new Error('MongoDB initialization failed; verify MONGO_URI, credentials, and Atlas network access', { cause: err });
   }
 }
 
@@ -52,6 +52,26 @@ async function ensureIndexes() {
   await recent.createIndex({ userId: 1, playedAt: -1 }).catch((e) => console.warn('recent idx:', e.message));
   const playlists = db.collection('playlists');
   await playlists.createIndex({ userId: 1, name: 1 }, { unique: true, partialFilterExpression: { name: { $exists: true } } }).catch((e) => console.warn('pl idx:', e.message));
+  await db.collection('search_history').createIndex({ userId: 1, queryKey: 1 }, { unique: true });
+  await db.collection('search_history').createIndex({ userId: 1, searchedAt: -1 });
+  await db.collection('followed_artists').createIndex({ userId: 1, artistId: 1 }, { unique: true });
+  await db.collection('saved_albums').createIndex({ userId: 1, albumId: 1 }, { unique: true });
+  const tracks = db.collection('drive_tracks');
+  try {
+    await tracks.dropIndex('driveFileId_1');
+  } catch (error) {
+    if (error.code !== 27 && error.code !== 26) throw error;
+  }
+  await tracks.createIndex({ ownerId: 1, driveFileId: 1 }, { unique: true });
+  await tracks.createIndex({ ownerId: 1, availability: 1, title: 1, _id: 1 });
+  await tracks.createIndex({ ownerId: 1, artistKeys: 1, availability: 1 });
+  await tracks.createIndex({ ownerId: 1, albumId: 1, discNumber: 1, trackNumber: 1 });
+  await tracks.createIndex({ ownerId: 1, 'genreEntries.key': 1, availability: 1 });
+  await db.collection('artwork_cache').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+  await db.collection('drive_connections').createIndex({ userId: 1 }, { unique: true });
+  await db.collection('drive_oauth_states').createIndex({ stateHash: 1 }, { unique: true });
+  await db.collection('drive_oauth_states').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+  await db.collection('drive_oauth_states').createIndex({ userId: 1 });
 }
 
 export async function closeDb() {

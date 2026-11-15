@@ -153,6 +153,117 @@ userDataRoutes.delete('/favorites/:trackId', async (req, res) => {
 
 const RECENT_CAP = 200;
 
+function requirePersonalAccount(req, res) {
+  if (req.ownerMode) {
+    branch(res, { status: 403, error: 'personal_account_required' });
+    return false;
+  }
+  return true;
+}
+
+function validId(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 256;
+}
+
+// Account-owned search history, de-duplicated by normalized query and capped
+// at thirty entries per user.
+userDataRoutes.get('/search-history', async (req, res) => {
+  try {
+    if (!requirePersonalAccount(req, res)) return;
+    const limit = Math.max(1, Math.min(50, Number.parseInt(req.query.limit, 10) || 20));
+    const rows = await col('search_history').find({ userId: req.user.id }).sort({ searchedAt: -1 }).limit(limit).toArray();
+    res.json({ searches: rows.map(({ _id, query, searchedAt }) => ({ id: String(_id), query, searchedAt })) });
+  } catch (err) { branch(res); }
+});
+
+userDataRoutes.post('/search-history', express.json(), async (req, res) => {
+  try {
+    if (!requirePersonalAccount(req, res)) return;
+    const query = String(req.body?.query ?? '').trim().slice(0, 120);
+    if (!query) return branch(res, { status: 400, error: 'query_required' });
+    const queryKey = query.normalize('NFKC').toLocaleLowerCase();
+    const searchedAt = new Date();
+    await col('search_history').updateOne({ userId: req.user.id, queryKey }, { $set: { userId: req.user.id, query, queryKey, searchedAt } }, { upsert: true });
+    const stale = await col('search_history').find({ userId: req.user.id }).sort({ searchedAt: -1 }).skip(30).project({ _id: 1 }).toArray();
+    if (stale.length) await col('search_history').deleteMany({ _id: { $in: stale.map((row) => row._id) } });
+    res.status(201).json({ query, searchedAt });
+  } catch (err) { branch(res); }
+});
+
+userDataRoutes.delete('/search-history', async (req, res) => {
+  try {
+    if (!requirePersonalAccount(req, res)) return;
+    await col('search_history').deleteMany({ userId: req.user.id });
+    res.json({ ok: true });
+  } catch (err) { branch(res); }
+});
+
+userDataRoutes.delete('/search-history/:query', async (req, res) => {
+  try {
+    if (!requirePersonalAccount(req, res)) return;
+    const queryKey = String(req.params.query).normalize('NFKC').toLocaleLowerCase();
+    await col('search_history').deleteOne({ userId: req.user.id, queryKey });
+    res.json({ ok: true });
+  } catch (err) { branch(res); }
+});
+
+userDataRoutes.get('/followed-artists', async (req, res) => {
+  try {
+    if (!requirePersonalAccount(req, res)) return;
+    const rows = await col('followed_artists').find({ userId: req.user.id }).sort({ followedAt: -1 }).toArray();
+    res.json({ artists: rows.map(({ artistId, name, followedAt }) => ({ id: artistId, name, followedAt })) });
+  } catch (err) { branch(res); }
+});
+
+userDataRoutes.put('/followed-artists/:artistId', express.json(), async (req, res) => {
+  try {
+    if (!requirePersonalAccount(req, res)) return;
+    const artistId = req.params.artistId;
+    const name = String(req.body?.name ?? '').trim().slice(0, 200);
+    if (!validId(artistId) || !name) return branch(res, { status: 400, error: 'invalid_artist' });
+    const followedAt = new Date();
+    await col('followed_artists').updateOne({ userId: req.user.id, artistId }, { $setOnInsert: { userId: req.user.id, artistId, name, followedAt } }, { upsert: true });
+    res.json({ artist: { id: artistId, name, followedAt } });
+  } catch (err) { branch(res); }
+});
+
+userDataRoutes.delete('/followed-artists/:artistId', async (req, res) => {
+  try {
+    if (!requirePersonalAccount(req, res)) return;
+    await col('followed_artists').deleteOne({ userId: req.user.id, artistId: req.params.artistId });
+    res.json({ ok: true });
+  } catch (err) { branch(res); }
+});
+
+userDataRoutes.get('/saved-albums', async (req, res) => {
+  try {
+    if (!requirePersonalAccount(req, res)) return;
+    const rows = await col('saved_albums').find({ userId: req.user.id }).sort({ savedAt: -1 }).toArray();
+    res.json({ albums: rows.map(({ albumId, name, artist, savedAt }) => ({ id: albumId, name, artist, savedAt })) });
+  } catch (err) { branch(res); }
+});
+
+userDataRoutes.put('/saved-albums/:albumId', express.json(), async (req, res) => {
+  try {
+    if (!requirePersonalAccount(req, res)) return;
+    const albumId = req.params.albumId;
+    const name = String(req.body?.name ?? '').trim().slice(0, 200);
+    const artist = String(req.body?.artist ?? '').trim().slice(0, 200);
+    if (!validId(albumId) || !name) return branch(res, { status: 400, error: 'invalid_album' });
+    const savedAt = new Date();
+    await col('saved_albums').updateOne({ userId: req.user.id, albumId }, { $setOnInsert: { userId: req.user.id, albumId, name, artist, savedAt } }, { upsert: true });
+    res.json({ album: { id: albumId, name, artist, savedAt } });
+  } catch (err) { branch(res); }
+});
+
+userDataRoutes.delete('/saved-albums/:albumId', async (req, res) => {
+  try {
+    if (!requirePersonalAccount(req, res)) return;
+    await col('saved_albums').deleteOne({ userId: req.user.id, albumId: req.params.albumId });
+    res.json({ ok: true });
+  } catch (err) { branch(res); }
+});
+
 userDataRoutes.get('/recent', async (req, res) => {
   try {
     if (req.ownerMode) return res.json({ recent: [] });
@@ -176,7 +287,7 @@ userDataRoutes.post('/recent', express.json(), async (req, res) => {
   } catch (err) { branch(res); }
 });
 
-const playlist = (doc) => ({ id: String(doc._id), name: doc.name, trackIds: doc.trackIds ?? [], createdAt: doc.createdAt, updatedAt: doc.updatedAt });
+const playlist = (doc) => ({ id: String(doc._id), name: doc.name, description: doc.description ?? '', trackIds: doc.trackIds ?? [], createdAt: doc.createdAt, updatedAt: doc.updatedAt });
 
 userDataRoutes.get('/playlists', async (req, res) => {
   try {
@@ -191,8 +302,9 @@ userDataRoutes.post('/playlists', express.json(), async (req, res) => {
     if (req.ownerMode) return branch(res, { status: 403, error: 'owner_mode' });
     const name = String(req.body?.name ?? '').trim();
     if (!name) return branch(res, { status: 400, error: 'name_required' });
+    if (name.length > 80) return branch(res, { status: 400, error: 'name_too_long' });
     const now = new Date();
-    const doc = { userId: req.user.id, name, trackIds: [], createdAt: now, updatedAt: now };
+    const doc = { userId: req.user.id, name, description: '', trackIds: [], createdAt: now, updatedAt: now };
     const inserted = await col('playlists').insertOne(doc);
     res.status(201).json({ playlist: playlist({ ...doc, _id: inserted.insertedId }) });
   } catch (err) {
@@ -204,17 +316,30 @@ userDataRoutes.put('/playlists/:id', express.json(), async (req, res) => {
   try {
     if (req.ownerMode) return branch(res, { status: 403, error: 'owner_mode' });
     const set = { updatedAt: new Date() };
-    if (req.body?.name != null) set.name = String(req.body.name);
-    if (Array.isArray(req.body?.trackIds)) set.trackIds = req.body.trackIds.map(String);
+    if (!ObjectId.isValid(req.params.id)) return branch(res, { status: 404, error: 'playlist_not_found' });
+    if (req.body?.name != null) {
+      const name = String(req.body.name).trim();
+      if (!name) return branch(res, { status: 400, error: 'name_required' });
+      if (name.length > 80) return branch(res, { status: 400, error: 'name_too_long' });
+      set.name = name;
+    }
+    if (req.body?.description != null) set.description = String(req.body.description).trim().slice(0, 300);
+    if (Array.isArray(req.body?.trackIds)) {
+      if (req.body.trackIds.length > 5000 || req.body.trackIds.some((id) => !validId(String(id)))) return branch(res, { status: 400, error: 'invalid_track_ids' });
+      set.trackIds = [...new Set(req.body.trackIds.map(String))];
+    }
     const result = await col('playlists').updateOne({ _id: new ObjectId(req.params.id), userId: req.user.id }, { $set: set });
     if (!result.matchedCount) return branch(res, { status: 404, error: 'playlist_not_found' });
     res.json({ ok: true });
-  } catch (err) { branch(res); }
+  } catch (err) {
+    branch(res, err?.code === 11000 ? { status: 409, error: 'playlist_exists' } : undefined);
+  }
 });
 
 userDataRoutes.delete('/playlists/:id', async (req, res) => {
   try {
     if (req.ownerMode) return branch(res, { status: 403, error: 'owner_mode' });
+    if (!ObjectId.isValid(req.params.id)) return branch(res, { status: 404, error: 'playlist_not_found' });
     await col('playlists').deleteOne({ _id: new ObjectId(req.params.id), userId: req.user.id });
     res.json({ ok: true });
   } catch (err) { branch(res); }

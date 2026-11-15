@@ -63,11 +63,11 @@ export async function loadSharedTokens({
   tokenFilePath = tokenFile,
   fileSystem = fs,
 } = {}) {
-  if (inlineJson) return JSON.parse(inlineJson);
   if (isMongoEnabled()) {
     const doc = await getCollection('gdrive_tokens').findOne({ _id: 'primary' });
     if (doc?.tokens) return doc.tokens;
   }
+  if (inlineJson) return JSON.parse(inlineJson);
   try {
     return JSON.parse(await fileSystem.readFile(tokenFilePath, 'utf8'));
   } catch (error) {

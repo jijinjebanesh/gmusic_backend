@@ -19,6 +19,28 @@ test('MongoDB token read failures are surfaced instead of falling back to a file
   assert.equal(fileReadAttempted, false);
 });
 
+test('MongoDB tokens take precedence over a stale inline token seed', async () => {
+  const tokens = await loadSharedTokens({
+    inlineJson: '{"refresh_token":"stale"}',
+    isMongoEnabled: () => true,
+    getCollection: () => ({
+      findOne: async () => ({ tokens: { refresh_token: 'fresh' } }),
+    }),
+  });
+  assert.deepEqual(tokens, { refresh_token: 'fresh' });
+});
+
+test('inline tokens seed MongoDB only when no shared token is stored', async () => {
+  const tokens = await loadSharedTokens({
+    inlineJson: '{"refresh_token":"seed"}',
+    isMongoEnabled: () => true,
+    getCollection: () => ({
+      findOne: async () => null,
+    }),
+  });
+  assert.deepEqual(tokens, { refresh_token: 'seed' });
+});
+
 test('MongoDB token write failures are surfaced without a filesystem fallback', async () => {
   let fileWriteAttempted = false;
   await assert.rejects(persistSharedTokens({ refresh_token: 'fresh' }, {

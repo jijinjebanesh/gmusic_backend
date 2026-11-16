@@ -402,6 +402,48 @@ test('playback polling, handoff, commands, and device visibility are account-sco
       database.collection('playback_sessions').documents[0].resumeOnFailover,
       false,
     );
+    const idempotent = await request('/playback/commands', {
+      method: 'POST',
+      body: {
+        action: 'pause',
+        idempotencyKey: '0123456789abcdef',
+        expectedRevision: resumedSession.revision,
+      },
+    });
+    const duplicate = await request('/playback/commands', {
+      method: 'POST',
+      body: {
+        action: 'pause',
+        idempotencyKey: '0123456789abcdef',
+        expectedRevision: resumedSession.revision,
+      },
+    });
+    assert.equal(idempotent.response.status, 202);
+    assert.equal(idempotent.body.duplicate, false);
+    assert.equal(duplicate.body.duplicate, true);
+    assert.equal(duplicate.body.commandId, idempotent.body.commandId);
+
+    const reusedKey = await request('/playback/commands', {
+      method: 'POST',
+      body: {
+        action: 'next',
+        idempotencyKey: '0123456789abcdef',
+        expectedRevision: resumedSession.revision,
+      },
+    });
+    assert.equal(reusedKey.response.status, 409);
+    assert.equal(reusedKey.body.error, 'idempotency_key_reused');
+
+    const staleCommand = await request('/playback/commands', {
+      method: 'POST',
+      body: {
+        action: 'next',
+        idempotencyKey: 'abcdef0123456789',
+        expectedRevision: resumedSession.revision - 1,
+      },
+    });
+    assert.equal(staleCommand.response.status, 409);
+    assert.equal(staleCommand.body.error, 'stale_playback_state');
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

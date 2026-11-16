@@ -1,5 +1,6 @@
 import express from 'express';
 import { ObjectId } from 'mongodb';
+import { isDeepStrictEqual } from 'node:util';
 import { col } from './db.js';
 import { publishPlaybackEvent } from './playback_event_bus.js';
 
@@ -155,6 +156,7 @@ function publicSession(session) {
     revision: session.revision || 0,
     transferId: session.lastTransferId || null,
     updatedAt: session.updatedAt || null,
+    serverTimestamp: session.updatedAt || null,
   };
 }
 
@@ -411,6 +413,311 @@ export async function pollPlayback({
   };
 }
 
+export async function createPlaybackCommand({
+  userId,
+  action,
+  payload,
+  idempotencyKey = null,
+  expectedRevision = null,
+  expectedQueueRevision = null,
+  collection = col,
+  now = () => new Date(),
+}) {
+  const commandAction = String(action || '');
+  const commandPayloadValue = commandPayload(commandAction, payload);
+  if (idempotencyKey !== null &&
+      (typeof idempotencyKey !== 'string' ||
+       !/^[A-Za-z0-9_-]{16,128}$/.test(idempotencyKey))) {
+    throw apiError(400, 'invalid_command');
+  }
+  const commands = collection('playback_commands');
+  if (idempotencyKey) {
+    const existing = await commands.findOne({ userId, idempotencyKey });
+    if (existing) {
+      if (existing.action !== commandAction ||
+          !isDeepStrictEqual(existing.payload, commandPayloadValue)) {
+        throw apiError(409, 'idempotency_key_reused');
+      }
+      return {
+        commandId: String(existing._id),
+        deviceId: existing.deviceId,
+        duplicate: true,
+      };
+    }
+  }
+
+  const session = await collection('playback_sessions').findOne({ _id: userId });
+  if (!session?.activeDeviceId) throw apiError(409, 'no_active_device');
+  if (expectedRevision !== null &&
+      expectedRevision !== (session.revision || 0)) {
+    throw apiError(409, 'stale_playback_state');
+  }
+  if (expectedQueueRevision !== null &&
+      expectedQueueRevision !== (session.queueRevision || 0)) {
+    throw apiError(409, 'stale_queue_state');
+  }
+  const queueLength = session.trackIds?.length || 0;
+  if ((commandAction === 'queuePlay' || commandAction === 'queueRemove') &&
+      commandPayloadValue.index >= queueLength) {
+    throw apiError(400, 'invalid_command');
+  }
+  if (commandAction === 'queueReorder' &&
+      (commandPayloadValue.from >= queueLength ||
+       commandPayloadValue.to >= queueLength)) {
+    throw apiError(400, 'invalid_command');
+  }
+  if (commandAction === 'queueAdd' && queueLength >= MAX_QUEUE_SIZE) {
+    throw apiError(400, 'invalid_command');
+  }
+  const deviceId = session.activeDeviceId;
+  const device = await collection('playback_devices').findOne({
+    userId,
+    deviceId,
+    lastSeenAt: { $gte: new Date(now().getTime() - DEVICE_ONLINE_MS) },
+  });
+  if (!device) throw apiError(409, 'device_offline');
+  const requiredCapability = commandAction === 'volume'
+    ? 'volume'
+    : commandAction === 'seek'
+    ? 'seek'
+    : commandAction === 'pause'
+    ? 'pause'
+    : commandAction.startsWith('queue')
+    ? 'queue'
+    : 'playback';
+  if (device.capabilities?.[requiredCapability] === false) {
+    throw apiError(409, 'capability_unavailable');
+  }
+  const createdAt = now();
+  let inserted;
+  try {
+    inserted = await commands.insertOne({
+      userId,
+      deviceId,
+      action: commandAction,
+      payload: commandPayloadValue,
+      ...(idempotencyKey ? { idempotencyKey } : {}),
+      status: 'pending',
+      createdAt,
+      expiresAt: new Date(createdAt.getTime() + COMMAND_TTL_MS),
+    });
+  } catch (error) {
+    if (error.code !== 11000 || !idempotencyKey) throw error;
+    const existing = await commands.findOne({ userId, idempotencyKey });
+    if (!existing) throw error;
+    if (existing.action !== commandAction ||
+        !isDeepStrictEqual(existing.payload, commandPayloadValue)) {
+      throw apiError(409, 'idempotency_key_reused');
+    }
+    return {
+      commandId: String(existing._id),
+      deviceId: existing.deviceId,
+      duplicate: true,
+    };
+  }
+  return {
+    commandId: String(inserted.insertedId),
+    deviceId,
+    duplicate: false,
+  };
+}
+
+export async function createPlaybackHandoff({
+  userId,
+  deviceId,
+  collection = col,
+  now = () => new Date(),
+}) {
+  if (!/^[A-Za-z0-9_-]{16,128}$/.test(String(deviceId || ''))) {
+    throw apiError(400, 'invalid_device');
+  }
+  const time = now();
+  const target = await collection('playback_devices').findOne({
+    userId,
+    deviceId,
+    lastSeenAt: { $gte: new Date(time.getTime() - DEVICE_ONLINE_MS) },
+  });
+  if (!target) throw apiError(409, 'device_offline');
+  if (target.capabilities?.playback === false) {
+    throw apiError(409, 'device_restricted');
+  }
+  const session = await collection('playback_sessions').findOne({ _id: userId });
+  if (!session?.activeDeviceId || !session.trackIds?.length) {
+    throw apiError(409, 'no_active_playback');
+  }
+  if (session.activeDeviceId === deviceId) {
+    return {
+      transferId: null,
+      status: 'completed',
+      session: publicSession(session),
+    };
+  }
+  const transferId = new ObjectId();
+  const expiresAt = new Date(time.getTime() + TRANSFER_TTL_MS);
+  const resumePlayback =
+    session.playing === true || session.resumeOnFailover === true;
+  const transfer = {
+    _id: transferId,
+    userId,
+    sourceDeviceId: session.activeDeviceId,
+    targetDeviceId: deviceId,
+    queueRevision: session.queueRevision || 0,
+    resumePlayback,
+    status: 'pending',
+    createdAt: time,
+    expiresAt,
+  };
+  await collection('playback_transfers').insertOne(transfer);
+  await collection('playback_commands').insertOne({
+    userId,
+    deviceId,
+    action: 'handoff',
+    payload: {
+      transferId: String(transferId),
+      session: publicSession({ ...session, playing: resumePlayback }),
+    },
+    status: 'pending',
+    createdAt: time,
+    expiresAt,
+  });
+  publishPlaybackEvent(userId, { deviceId });
+  return { transferId: String(transferId), status: 'pending' };
+}
+
+export async function acknowledgePlaybackCommand({
+  userId,
+  commandId,
+  deviceId,
+  status,
+  error: commandError,
+  collection = col,
+  now = () => new Date(),
+}) {
+  if (!ObjectId.isValid(commandId) || !['ok', 'failed'].includes(status)) {
+    throw apiError(400, 'invalid_acknowledgment');
+  }
+  const acknowledgedAt = now();
+  const command = await collection('playback_commands').findOne({
+    _id: new ObjectId(commandId),
+    userId,
+    deviceId,
+    status: 'pending',
+  });
+  if (!command) throw apiError(404, 'command_not_found');
+  if (command.expiresAt <= acknowledgedAt) {
+    await collection('playback_commands').updateOne(
+      {
+        _id: command._id,
+        userId,
+        deviceId,
+        status: 'pending',
+        expiresAt: { $lte: acknowledgedAt },
+      },
+      {
+        $set: {
+          status: 'failed',
+          error: 'command_timeout',
+          acknowledgedAt,
+        },
+      },
+    );
+    throw apiError(409, 'command_expired');
+  }
+  const result = await collection('playback_commands').updateOne(
+    {
+      _id: command._id,
+      userId,
+      deviceId,
+      status: 'pending',
+      expiresAt: { $gt: acknowledgedAt },
+    },
+    {
+      $set: {
+        status,
+        acknowledgedAt,
+        error: status === 'failed'
+          ? String(commandError || 'command_failed').slice(0, 120)
+          : null,
+      },
+    },
+  );
+  if (!result.matchedCount) throw apiError(404, 'command_not_found');
+
+  let transferStatus = null;
+  if (command.action === 'handoff') {
+    const transferId = new ObjectId(command.payload.transferId);
+    const transfers = collection('playback_transfers');
+    const transfer = await transfers.findOne({
+      _id: transferId,
+      userId,
+      targetDeviceId: deviceId,
+      status: 'pending',
+    });
+    if (transfer) {
+      let transferError = status === 'failed'
+        ? String(commandError || 'target_rejected').slice(0, 120)
+        : null;
+      if (!transferError) {
+        const currentSession = await collection('playback_sessions').findOne({
+          _id: userId,
+        });
+        const target = await collection('playback_devices').findOne({
+          userId,
+          deviceId,
+          lastSeenAt: {
+            $gte: new Date(now().getTime() - DEVICE_ONLINE_MS),
+          },
+        });
+        if (!target) transferError = 'device_offline';
+        else if (
+          currentSession?.activeDeviceId !== transfer.sourceDeviceId ||
+          (currentSession.queueRevision || 0) !== transfer.queueRevision
+        ) {
+          transferError = 'playback_changed';
+        } else {
+          try {
+            await updateSession(
+              collection('playback_sessions'),
+              userId,
+              {
+                activeDeviceId: deviceId,
+                lastTransferId: String(transferId),
+                playing: transfer.resumePlayback === true,
+                resumeOnFailover: false,
+              },
+              { updatedAt: now() },
+            );
+          } catch (updateError) {
+            if (updateError.code !== 'playback_conflict') throw updateError;
+            transferError = 'playback_changed';
+          }
+        }
+      }
+      transferStatus = transferError ? 'failed' : 'completed';
+      await transfers.updateOne(
+        { _id: transferId, userId, status: 'pending' },
+        {
+          $set: {
+            status: transferStatus,
+            ...(transferError ? { error: transferError } : {}),
+            completedAt: now(),
+          },
+        },
+      );
+    }
+  }
+  publishPlaybackEvent(userId);
+  return {
+    ok: true,
+    commandId: String(command._id),
+    status,
+    error: status === 'failed'
+      ? String(commandError || 'command_failed').slice(0, 120)
+      : null,
+    transferStatus,
+  };
+}
+
 export function createPlaybackRouter({
   collection = col,
   now = () => new Date(),
@@ -459,59 +766,13 @@ export function createPlaybackRouter({
   router.post('/playback/handoff', async (req, res, next) => {
     if (!requirePersonalAccount(req, res)) return;
     try {
-      const deviceId = String(req.body?.deviceId || '');
-      if (!/^[A-Za-z0-9_-]{16,128}$/.test(deviceId)) {
-        throw apiError(400, 'invalid_device');
-      }
-      const userId = req.user.id;
-      const time = now();
-      const target = await collection('playback_devices').findOne({
-        userId,
-        deviceId,
-        lastSeenAt: { $gte: new Date(time.getTime() - DEVICE_ONLINE_MS) },
+      const result = await createPlaybackHandoff({
+        userId: req.user.id,
+        deviceId: req.body?.deviceId,
+        collection,
+        now,
       });
-      if (!target) throw apiError(409, 'device_offline');
-      if (target.capabilities?.playback === false) {
-        throw apiError(409, 'device_restricted');
-      }
-      const session = await collection('playback_sessions').findOne({ _id: userId });
-      if (!session?.activeDeviceId || !session.trackIds?.length) {
-        throw apiError(409, 'no_active_playback');
-      }
-      if (session.activeDeviceId === deviceId) {
-        res.json({ transferId: null, status: 'completed', session: publicSession(session) });
-        return;
-      }
-      const transferId = new ObjectId();
-      const expiresAt = new Date(time.getTime() + TRANSFER_TTL_MS);
-      const resumePlayback =
-        session.playing === true || session.resumeOnFailover === true;
-      const transfer = {
-        _id: transferId,
-        userId,
-        sourceDeviceId: session.activeDeviceId,
-        targetDeviceId: deviceId,
-        queueRevision: session.queueRevision || 0,
-        resumePlayback,
-        status: 'pending',
-        createdAt: time,
-        expiresAt,
-      };
-      await collection('playback_transfers').insertOne(transfer);
-      await collection('playback_commands').insertOne({
-        userId,
-        deviceId,
-        action: 'handoff',
-        payload: {
-          transferId: String(transferId),
-          session: publicSession({ ...session, playing: resumePlayback }),
-        },
-        status: 'pending',
-        createdAt: time,
-        expiresAt,
-      });
-      publishPlaybackEvent(userId, { deviceId });
-      res.status(202).json({ transferId: String(transferId), status: 'pending' });
+      res.status(result.status === 'pending' ? 202 : 200).json(result);
     } catch (error) { next(error); }
   });
 
@@ -642,53 +903,21 @@ export function createPlaybackRouter({
   router.post('/playback/commands', async (req, res, next) => {
     if (!requirePersonalAccount(req, res)) return;
     try {
-      const action = String(req.body?.action || '');
-      const payload = commandPayload(action, req.body?.payload);
-      const userId = req.user.id;
-      const session = await collection('playback_sessions').findOne({ _id: userId });
-      if (!session?.activeDeviceId) throw apiError(409, 'no_active_device');
-      const queueLength = session.trackIds?.length || 0;
-      if ((action === 'queuePlay' || action === 'queueRemove') &&
-          payload.index >= queueLength) {
-        throw apiError(400, 'invalid_command');
-      }
-      if (action === 'queueReorder' &&
-          (payload.from >= queueLength || payload.to >= queueLength)) {
-        throw apiError(400, 'invalid_command');
-      }
-      if (action === 'queueAdd' && queueLength >= MAX_QUEUE_SIZE) {
-        throw apiError(400, 'invalid_command');
-      }
-      const device = await collection('playback_devices').findOne({
-        userId,
-        deviceId: session.activeDeviceId,
-        lastSeenAt: { $gte: new Date(now().getTime() - DEVICE_ONLINE_MS) },
+      const result = await createPlaybackCommand({
+        userId: req.user.id,
+        action: req.body?.action,
+        payload: req.body?.payload,
+        idempotencyKey: req.body?.idempotencyKey ?? null,
+        expectedRevision: req.body?.expectedRevision ?? null,
+        expectedQueueRevision: req.body?.expectedQueueRevision ?? null,
+        collection,
+        now,
       });
-      if (!device) throw apiError(409, 'device_offline');
-      const requiredCapability = action === 'volume'
-        ? 'volume'
-        : action === 'seek'
-        ? 'seek'
-        : action === 'pause'
-        ? 'pause'
-        : action.startsWith('queue')
-        ? 'queue'
-        : 'playback';
-      if (device.capabilities?.[requiredCapability] === false) {
-        throw apiError(409, 'capability_unavailable');
-      }
-      const createdAt = now();
-      const result = await collection('playback_commands').insertOne({
-        userId,
-        deviceId: session.activeDeviceId,
-        action,
-        payload,
-        status: 'pending',
-        createdAt,
-        expiresAt: new Date(createdAt.getTime() + COMMAND_TTL_MS),
+      publishPlaybackEvent(req.user.id, { deviceId: result.deviceId });
+      res.status(202).json({
+        commandId: result.commandId,
+        duplicate: result.duplicate,
       });
-      publishPlaybackEvent(userId, { deviceId: session.activeDeviceId });
-      res.status(202).json({ commandId: String(result.insertedId) });
     } catch (error) { next(error); }
   });
 
@@ -748,120 +977,16 @@ export function createPlaybackRouter({
   router.post('/playback/commands/:commandId/ack', async (req, res, next) => {
     if (!requirePersonalAccount(req, res)) return;
     try {
-      if (!ObjectId.isValid(req.params.commandId) ||
-          !['ok', 'failed'].includes(req.body?.status)) {
-        throw apiError(400, 'invalid_acknowledgment');
-      }
-      const deviceId = String(req.body?.deviceId || '');
-      const acknowledgedAt = now();
-      const command = await collection('playback_commands').findOne({
-        _id: new ObjectId(req.params.commandId),
+      const result = await acknowledgePlaybackCommand({
         userId: req.user.id,
-        deviceId,
-        status: 'pending',
+        commandId: req.params.commandId,
+        deviceId: String(req.body?.deviceId || ''),
+        status: req.body?.status,
+        error: req.body?.error,
+        collection,
+        now,
       });
-      if (!command) throw apiError(404, 'command_not_found');
-      if (command.expiresAt <= acknowledgedAt) {
-        await collection('playback_commands').updateOne(
-          {
-            _id: command._id,
-            userId: req.user.id,
-            deviceId,
-            status: 'pending',
-            expiresAt: { $lte: acknowledgedAt },
-          },
-          {
-            $set: {
-              status: 'failed',
-              error: 'command_timeout',
-              acknowledgedAt,
-            },
-          },
-        );
-        throw apiError(409, 'command_expired');
-      }
-      const result = await collection('playback_commands').updateOne(
-        {
-          _id: new ObjectId(req.params.commandId),
-          userId: req.user.id,
-          deviceId,
-          status: 'pending',
-          expiresAt: { $gt: acknowledgedAt },
-        },
-        {
-          $set: {
-            status: req.body.status,
-            acknowledgedAt,
-            error: req.body.status === 'failed'
-              ? String(req.body.error || 'command_failed').slice(0, 120)
-              : null,
-          },
-        },
-      );
-      if (!result.matchedCount) throw apiError(404, 'command_not_found');
-      let transferStatus = null;
-      if (command.action === 'handoff') {
-        const transferId = new ObjectId(command.payload.transferId);
-        const transfers = collection('playback_transfers');
-        const transfer = await transfers.findOne({
-          _id: transferId,
-          userId: req.user.id,
-          targetDeviceId: deviceId,
-          status: 'pending',
-        });
-        if (transfer) {
-          let error = req.body.status === 'failed'
-            ? String(req.body.error || 'target_rejected').slice(0, 120)
-            : null;
-          if (!error) {
-            const currentSession = await collection('playback_sessions').findOne({
-              _id: req.user.id,
-            });
-            const target = await collection('playback_devices').findOne({
-              userId: req.user.id,
-              deviceId,
-              lastSeenAt: { $gte: new Date(now().getTime() - DEVICE_ONLINE_MS) },
-            });
-            if (!target) error = 'device_offline';
-            else if (
-              currentSession?.activeDeviceId !== transfer.sourceDeviceId ||
-              (currentSession.queueRevision || 0) !== transfer.queueRevision
-            ) {
-              error = 'playback_changed';
-            } else {
-              try {
-                await updateSession(
-                  collection('playback_sessions'),
-                  req.user.id,
-                  {
-                    activeDeviceId: deviceId,
-                    lastTransferId: String(transferId),
-                    playing: transfer.resumePlayback === true,
-                    resumeOnFailover: false,
-                  },
-                  { updatedAt: now() },
-                );
-              } catch (updateError) {
-                if (updateError.code !== 'playback_conflict') throw updateError;
-                error = 'playback_changed';
-              }
-            }
-          }
-          transferStatus = error ? 'failed' : 'completed';
-          await transfers.updateOne(
-            { _id: transferId, userId: req.user.id, status: 'pending' },
-            {
-              $set: {
-                status: transferStatus,
-                ...(error ? { error } : {}),
-                completedAt: now(),
-              },
-            },
-          );
-        }
-      }
-      if (transferStatus) publishPlaybackEvent(req.user.id);
-      res.json({ ok: true, transferStatus });
+      res.json(result);
     } catch (error) { next(error); }
   });
 

@@ -80,6 +80,13 @@ async function ensureIndexes() {
   await db.collection('playback_sessions').createIndex({ userId: 1 }, { unique: true });
   const playbackCommands = db.collection('playback_commands');
   await playbackCommands.createIndex({ userId: 1, deviceId: 1, status: 1, createdAt: 1 });
+  await playbackCommands.createIndex(
+    { userId: 1, idempotencyKey: 1 },
+    {
+      unique: true,
+      partialFilterExpression: { idempotencyKey: { $exists: true } },
+    },
+  );
   await playbackCommands.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
   const playbackTransfers = db.collection('playback_transfers');
   await playbackTransfers.createIndex({ userId: 1, createdAt: -1 });

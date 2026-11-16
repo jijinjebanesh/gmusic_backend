@@ -14,7 +14,7 @@ OAuth client secret anywhere but this service.
 
 | Route | Purpose |
 | --- | --- |
-| `GET /health` | liveness; reports `authMode`, `driveMode`, `runtime`, and playback realtime mode |
+| `GET /health` | liveness; reports `authMode`, `driveMode`, `runtime`, Socket.IO mode, and Redis readiness |
 | `POST /api/v1/auth/register` · `POST /api/v1/auth/login` | account sign-up / sign-in → 30-day session token |
 | `POST /api/v1/auth/logout` · `GET /api/v1/auth/me` | session management |
 | `POST /api/v1/drive/oauth/start` · `GET /api/v1/drive/oauth/callback` | starts authorization for the common Drive by default; per-user PKCE is optional |
@@ -26,7 +26,7 @@ OAuth client secret anywhere but this service.
 | `POST /api/v1/catalog/tracks/resolve` | Resolves up to 500 track IDs for playback handoff |
 | `GET /api/v1/catalog/tracks/:id/lyrics` | Embedded lyrics from indexed audio tags; returns `lyrics_not_found` when absent |
 | `GET /api/v1/playback/state` · `POST /api/v1/playback/poll` | Account-scoped device registry and versioned playback session |
-| `WS /api/v1/playback/socket` | Authenticated realtime session sync and command delivery |
+| `Socket.IO /api/v1/playback/socket` | Authenticated device presence, playback sync, command delivery/acknowledgments and transfers; WebSocket transport only |
 | `POST /api/v1/playback/handoff` · `GET /api/v1/playback/transfers/:id` | Prepare, acknowledge and inspect a playback transfer |
 | `POST /api/v1/playback/commands` · `GET/DELETE /api/v1/playback/commands/:id` | Queue, inspect or cancel an acknowledged remote command |
 | `POST /api/v1/playback/commands/:commandId/ack` | Acknowledge remote command execution or transfer preparation |
@@ -55,30 +55,38 @@ accepts only a valid, database-backed, one-use state bound to the initiating
 user.
 
 Connected playback requires a signed-in personal account; owner-token mode is
-not accepted. Clients connect to `/api/v1/playback/socket` using the account
-session token in the first WebSocket frame (never in the URL). Authenticated
-WebSocket heartbeats carry player snapshots and receive session changes and
-commands in real time. The HTTP polling API remains as a reconnect and
-cross-instance fallback; devices are considered offline after 12 seconds
-without a heartbeat. If the active device expires while playing, an online
-client can take over through the normal acknowledged handoff; playback resumes
-on the replacement device after it prepares the queue. Commands are
-acknowledged, have bounded lifetimes, and can be cancelled if they time out. A
-transfer keeps the source authoritative until the online target resolves the
-queue and acknowledges that it has prepared the requested track. A failed
-transfer leaves the source active. The
-target resolves track IDs into fresh stream tickets; queue revisions prevent a
-transfer from switching to a stale queue. Queues are capped at 500 tracks, and
-active-player volume is synchronized when the player reports it. Devices can
-be renamed and hidden from other clients on the same account; stale offline
-entries can be forgotten.
+not accepted. Clients pass the account session token in the authenticated
+Socket.IO handshake (never in the URL). `device:register` authorizes the
+account-scoped device room; `device:heartbeat` and `playback:sync` reconcile
+against MongoDB; `playback:command` and `playback:transfer` create durable
+requests; and `playback:command:ack` records execution on the active player.
+`playback:changed` and `playback:command:result` are notifications, not the
+source of truth. The client uses WebSocket-only transport, so Engine.IO does
+not depend on HTTP long-polling stickiness.
 
-Vercel WebSocket support requires Fluid Compute. Connections close when the
-Function reaches its configured maximum duration, so clients reconnect with
-backoff and resynchronize from MongoDB. Configure the Vercel Upstash Redis
-integration and its `REDIS_URL` environment variable to relay lightweight
-playback-change notifications between Function instances. Without Redis,
-clients continue using HTTP polling for reliable cross-instance sync.
+The Socket.IO Redis adapter relays room events between instances when
+`REDIS_URL` is configured and ready. It does not recover missed events; after
+connect or reconnect, clients fetch authoritative session, device and queue
+state from MongoDB. `/health` reports `playbackRealtime` and `playbackRedis`;
+`socketio_local` means realtime broadcasts are instance-local and clients use
+the REST polling recovery path. The HTTP polling and command endpoints remain
+available for recovery and compatibility. Devices are considered offline
+after 12 seconds without a heartbeat. If the active device expires while
+playing, an online client can take over through the normal acknowledged
+handoff; playback resumes on the replacement device after it prepares the
+queue. Commands have bounded lifetimes and can be cancelled if they time out.
+A transfer keeps the source authoritative until the online target resolves
+the queue and acknowledges preparation. A failed transfer leaves the source
+active. Queue revisions reject stale queue operations and prevent transfers
+from switching to a stale queue. Queues are capped at 500 tracks.
+
+Vercel WebSocket support requires Fluid Compute. The dedicated Socket.IO
+Function is configured for a 300-second maximum duration; connections still
+close at that limit, so clients reconnect with backoff and resynchronize from
+MongoDB. WebSocket-only transport avoids Engine.IO polling affinity, while
+Redis carries cross-instance room events. Configure Fluid Compute and the
+Vercel Upstash Redis integration before deployment. If Redis is unavailable,
+the health response reports that state and clients continue with REST polling.
 
 Discovery is account-based, so authenticated GMusic clients can find each
 other across networks. This registry does not discover third-party speakers or
@@ -133,6 +141,7 @@ boot crash, if env vars are set to local PC values:
 | `MONGO_URI` | yes | Atlas URI; required for login, the shared catalog, and user-owned app data |
 | `REQUIRE_MONGO` | production recommended | Set `true` to fail startup when `MONGO_URI` is absent. Vercel deployments require MongoDB automatically; a configured but unreachable Atlas also fails startup instead of downgrading to token-only mode. |
 | `MONGO_DB` | no | defaults to `Gmusic` |
+| `REDIS_URL` | realtime cross-instance sync | Upstash Redis TLS connection URL (`rediss://...`). The Socket.IO Redis adapter uses separate publisher and subscriber clients; do not use the REST-only Upstash URL/token here. |
 | `GDRIVE_CREDENTIALS` | yes | inline JSON of the OAuth client (`{"installed":{...}}`) — paste the file *contents*, never a path. A Windows path like `D:/jaip/credentials.json` exists only on the PC and crashes boot on a serverless host. With no credentials the service still boots (login works); Drive routes answer 428 `google_drive_not_connected` until it is set. |
 | `GMUSIC_DRIVE_MODE` | no | defaults to `shared`; set exactly to `per_user` only when each GMusic account must connect a separate Drive |
 | `GDRIVE_REDIRECT_URI` | no | common-Drive callback; defaults to `https://$VERCEL_PROJECT_PRODUCTION_URL/` on Vercel (falls back to `VERCEL_URL`) or `http://localhost:43821/` locally |
@@ -177,9 +186,9 @@ retrying — pasted passwords frequently carry sentence punctuation.
 
 ## Serverless caveats
 
-- `api/index.js` runs with `maxDuration: 60` (Vercel Hobby ceiling). Long
-  audio streams from a slow mobile connection can hit it; the local bridge is
-  the unlimited fallback.
+- `api/index.js` runs with `maxDuration: 60`. The Socket.IO endpoint runs as
+  `api/v1/playback/socket.js` with `maxDuration: 300`; WebSockets require
+  Fluid Compute and reconnect when the function reaches that limit.
 - Stream/art tickets are stateless HMAC-signed and work across serverless
   instances; each ticket expires after eight hours.
 - Artwork bytes are cached in MongoDB with a size cap and TTL; no thumbnails

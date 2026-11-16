@@ -1,104 +1,103 @@
-import crypto from 'node:crypto';
-import Redis from 'ioredis';
+import { createClient } from 'redis';
+import { createAdapter } from '@socket.io/redis-adapter';
 
-const CHANNEL = 'gmusic:playback:events:v1';
-const instanceId = crypto.randomUUID();
-const eventSalt = process.env.MORNYE_API_TOKEN || 'gmusic-playback-events-v1';
-const listenersByUser = new Map();
-const redisUrl = process.env.REDIS_URL;
-const publisher = redisUrl
-  ? new Redis(redisUrl, {
-      maxRetriesPerRequest: 1,
-      retryStrategy: (attempt) => Math.min(attempt * 250, 5_000),
-    })
-  : null;
-const subscriber = publisher?.duplicate();
-let subscribed = false;
+let io;
+let publisher;
+let subscriber;
+let redisConfigured = false;
 
-function keyFor(value) {
-  return crypto.createHmac('sha256', eventSalt).update(String(value)).digest('base64url');
-}
-
-function dispatch(event) {
-  for (const listener of listenersByUser.get(event.userKey) || []) {
-    if (event.exceptConnectionId === listener.connectionId) continue;
-    if (event.deviceKey && event.deviceKey !== listener.deviceKey) continue;
-    listener.onEvent(event);
-  }
-}
-
-if (subscriber) {
-  subscriber.on('message', (channel, raw) => {
-    if (channel !== CHANNEL) return;
-    try {
-      const event = JSON.parse(raw);
-      if (event.instanceId !== instanceId) dispatch(event);
-    } catch (error) {
-      console.error('Invalid playback event received from Redis:', error.name);
-    }
-  });
-  subscriber.on('ready', () => {
-    void subscriber.subscribe(CHANNEL).then(() => {
-      subscribed = true;
-    }).catch((error) => {
-      subscribed = false;
-      console.error('Could not subscribe to playback Redis events:', error.name);
-    });
-  });
-  subscriber.on('close', () => {
-    subscribed = false;
-  });
-  subscriber.on('error', (error) => {
-    subscribed = false;
-    console.error('Playback Redis subscriber error:', error.name);
-  });
-  publisher.on('error', (error) => {
-    console.error('Playback Redis publisher error:', error.name);
-  });
-}
-
-export function subscribePlaybackEvents({
-  userId,
-  deviceId,
-  connectionId,
-  onEvent,
-}) {
-  const userKey = keyFor(userId);
-  const listeners = listenersByUser.get(userKey) || new Set();
-  const listener = {
-    deviceKey: keyFor(deviceId),
-    connectionId,
-    onEvent,
-  };
-  listeners.add(listener);
-  listenersByUser.set(userKey, listeners);
-  return () => {
-    listeners.delete(listener);
-    if (listeners.size === 0) listenersByUser.delete(userKey);
-  };
-}
-
-export function publishPlaybackEvent(
-  userId,
-  { deviceId = null, exceptConnectionId = null } = {},
+export async function configurePlaybackEventBus(
+  socketServer,
+  { redisUrl = process.env.REDIS_URL, timeoutMs = 5_000 } = {},
 ) {
-  const event = {
-    userKey: keyFor(userId),
-    deviceKey: deviceId ? keyFor(deviceId) : null,
-    exceptConnectionId,
-    instanceId,
-  };
-  dispatch(event);
-  if (publisher?.status === 'ready' && subscribed) {
-    void publisher.publish(CHANNEL, JSON.stringify({
-      ...event,
-      exceptConnectionId: null,
-    })).catch((error) => {
-      console.error('Could not publish playback Redis event:', error.name);
+  io = socketServer;
+  redisConfigured = Boolean(redisUrl);
+  if (!redisUrl) {
+    console.warn(
+      'REDIS_URL is not configured; playback sockets use local realtime with REST polling recovery.',
+    );
+    return false;
+  }
+
+  publisher = createClient({
+    url: redisUrl,
+    socket: {
+      reconnectStrategy: (attempt) => Math.min(attempt * 250, 5_000),
+    },
+  });
+  subscriber = publisher.duplicate();
+  for (const [name, client] of [
+    ['publisher', publisher],
+    ['subscriber', subscriber],
+  ]) {
+    client.on('error', (error) => {
+      console.error(`Playback Redis ${name} error:`, error.name);
     });
   }
+  publisher.on('end', () => {
+    console.error('Playback Redis publisher disconnected.');
+  });
+  subscriber.on('end', () => {
+    console.error('Playback Redis subscriber disconnected.');
+  });
+
+  socketServer.adapter(createAdapter(publisher, subscriber));
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    Promise.all([publisher.connect(), subscriber.connect()]).then(
+      () => {
+        clearTimeout(timer);
+        resolve(true);
+      },
+      (error) => {
+        clearTimeout(timer);
+        console.error('Playback Redis adapter connection failed:', error.name);
+        resolve(false);
+      },
+    );
+  });
+}
+
+export function attachPlaybackSocketServer(socketServer) {
+  io = socketServer;
+}
+
+export function publishPlaybackEvent(userId, { deviceId = null } = {}) {
+  if (!io || !userId) return;
+  const room = deviceId
+    ? deviceRoom(userId, deviceId)
+    : userRoom(userId);
+  io.to(room).emit('playback:changed', {
+    deviceId,
+    serverTimestamp: new Date().toISOString(),
+  });
 }
 
 export function playbackEventsAreShared() {
-  return publisher?.status === 'ready' && subscribed;
+  return publisher?.isReady === true && subscriber?.isReady === true;
+}
+
+export function playbackRealtimeStatus() {
+  if (playbackEventsAreShared()) return 'socketio_redis';
+  return io ? 'socketio_local' : 'rest_polling';
+}
+
+export function playbackRedisStatus() {
+  if (!redisConfigured) return 'not_configured';
+  if (playbackEventsAreShared()) return 'ready';
+  if (
+    (publisher?.isOpen === true && publisher?.isReady !== true) ||
+    (subscriber?.isOpen === true && subscriber?.isReady !== true)
+  ) {
+    return 'connecting';
+  }
+  return 'disconnected';
+}
+
+export function userRoom(userId) {
+  return `user:${userId}`;
+}
+
+export function deviceRoom(userId, deviceId) {
+  return `device:${userId}:${deviceId}`;
 }

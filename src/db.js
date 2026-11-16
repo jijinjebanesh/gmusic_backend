@@ -81,6 +81,9 @@ async function ensureIndexes() {
   const playbackCommands = db.collection('playback_commands');
   await playbackCommands.createIndex({ userId: 1, deviceId: 1, status: 1, createdAt: 1 });
   await playbackCommands.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+  const playbackTransfers = db.collection('playback_transfers');
+  await playbackTransfers.createIndex({ userId: 1, createdAt: -1 });
+  await playbackTransfers.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 }
 
 export async function closeDb() {

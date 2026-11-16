@@ -1,11 +1,14 @@
 import crypto from 'node:crypto';
 import express from 'express';
+import { createServer } from 'node:http';
 import helmet from 'helmet';
 import pinoHttp from 'pino-http';
 import { readInstalledCredentials, createDriveSession, createDisabledDrive } from './drive.js';
 import { col, initDb, mongoEnabled } from './db.js';
 import { authRoutes, userDataRoutes, attachUser } from './auth.js';
 import { playbackRoutes } from './playback.js';
+import { playbackEventsAreShared } from './playback_event_bus.js';
+import { attachPlaybackWebSocket } from './playback_websocket.js';
 import { createDriveConnectionService } from './drive_connections.js';
 import { apiErrorCode } from './api_error_code.js';
 import {
@@ -184,6 +187,7 @@ app.get('/health', (_req, res) => res.json({
   runtime: onVercel ? 'vercel' : 'local',
   authMode: mongoEnabled() ? 'user_login' : 'token',
   database: mongoEnabled() ? 'connected' : 'not_configured',
+  playbackRealtime: playbackEventsAreShared() ? 'websocket_redis' : 'polling_fallback',
   driveMode,
   drive: drive.configured === false ? 'not_configured' : drive.authorized ? 'authorized' : 'not_authorized',
   ...(driveReason ? { driveReason } : {}),
@@ -508,13 +512,16 @@ app.use((err, _req, res, _next) => {
   );
   res.status(status).json({ error });
 });
-// Local run: this process owns the port. Under Vercel the exported app below
-// is the request handler instead (a listening server would fail to boot).
+const server = createServer(app);
+attachPlaybackWebSocket(server, { apiToken });
+
+// Local run: this process owns the port. Vercel exports the same HTTP server
+// so its Function runtime can handle WebSocket upgrades.
 if (!onVercel) {
-  app.listen(port, process.env.HOST || '127.0.0.1', () => {
+  server.listen(port, process.env.HOST || '127.0.0.1', () => {
     console.log(`Mornye Drive bridge listening on ${process.env.HOST || '127.0.0.1'}:${port}`);
     console.log(`OAuth redirect URI: ${redirectUri}`);
   });
 }
 
-export default app;
+export default server;

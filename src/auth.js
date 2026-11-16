@@ -19,6 +19,8 @@ const publicUser = (user) => ({
   displayName: user.displayName ?? user.username ?? user.email ?? null,
   role: user.role ?? 'user',
 });
+const authenticationError = (status, code) =>
+  Object.assign(new Error(code), { status, code });
 
 async function createSession(user) {
   const token = crypto.randomBytes(32).toString('base64url');
@@ -82,27 +84,53 @@ authRoutes.post('/login', express.json(), async (req, res) => {
 
 // Mount under /api/v1 AFTER authRoutes. Accepts a session token, or (owner
 // mode) the MORNYE_API_TOKEN so single-user tooling keeps working.
+export async function authenticateBearerToken(
+  bearer,
+  apiToken,
+  { renew = true } = {},
+) {
+  if (!bearer) throw authenticationError(401, 'unauthorized');
+  if (apiToken && bearer === apiToken) {
+    return {
+      user: {
+        id: 'owner',
+        email: 'owner@local',
+        displayName: 'Owner',
+        role: 'owner',
+      },
+      ownerMode: true,
+    };
+  }
+  if (!mongoEnabled()) throw authenticationError(503, 'mongo_unavailable');
+  const session = await col('sessions').findOne({
+    tokenHash: tokenHash(bearer),
+  });
+  if (!session || session.expiresAt < new Date()) {
+    throw authenticationError(401, 'session_expired');
+  }
+  const user = await col('Users').findOne({ _id: session.userId });
+  if (!user) throw authenticationError(401, 'session_user_missing');
+  if (renew) {
+    await col('sessions').updateOne(
+      { _id: session._id },
+      { $set: { expiresAt: new Date(Date.now() + SESSION_DAYS * 86_400_000) } },
+    );
+  }
+  return { user: publicUser(user), ownerMode: false };
+}
+
 export function attachUser(apiToken) {
   return async (req, res, next) => {
     const bearer = String(req.get('authorization') || '').replace(/^Bearer /i, '');
-    if (!bearer) return res.status(401).json({ error: 'unauthorized' });
-    if (apiToken && bearer === apiToken) {
-      req.user = { id: 'owner', email: 'owner@local', displayName: 'Owner', role: 'owner' };
-      req.ownerMode = true;
-      return next();
-    }
-    if (!mongoEnabled()) return res.status(503).json({ error: 'mongo_unavailable' });
     try {
-      const session = await col('sessions').findOne({ tokenHash: tokenHash(bearer) });
-      if (!session || session.expiresAt < new Date()) return res.status(401).json({ error: 'session_expired' });
-      const user = await col('Users').findOne({ _id: session.userId });
-      if (!user) return res.status(401).json({ error: 'session_user_missing' });
-      // Sliding renewal: keep the token alive while it is used.
-      await col('sessions').updateOne({ _id: session._id }, { $set: { expiresAt: new Date(Date.now() + SESSION_DAYS * 86_400_000) } });
-      req.user = publicUser(user);
-      req.ownerMode = false;
+      const authenticated = await authenticateBearerToken(bearer, apiToken);
+      req.user = authenticated.user;
+      req.ownerMode = authenticated.ownerMode;
       next();
-    } catch (err) { next(err); }
+    } catch (error) {
+      if (error.status) return res.status(error.status).json({ error: error.code });
+      next(error);
+    }
   };
 }
 

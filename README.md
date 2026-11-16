@@ -14,7 +14,7 @@ OAuth client secret anywhere but this service.
 
 | Route | Purpose |
 | --- | --- |
-| `GET /health` | liveness; reports `authMode`, `driveMode`, and `runtime` |
+| `GET /health` | liveness; reports `authMode`, `driveMode`, `runtime`, and playback realtime mode |
 | `POST /api/v1/auth/register` · `POST /api/v1/auth/login` | account sign-up / sign-in → 30-day session token |
 | `POST /api/v1/auth/logout` · `GET /api/v1/auth/me` | session management |
 | `POST /api/v1/drive/oauth/start` · `GET /api/v1/drive/oauth/callback` | starts authorization for the common Drive by default; per-user PKCE is optional |
@@ -25,9 +25,12 @@ OAuth client secret anywhere but this service.
 | `GET /api/v1/catalog/tracks` · `GET /api/v1/catalog/tracks/:id` | Paginated indexed tracks with normalized tags and stream tickets |
 | `POST /api/v1/catalog/tracks/resolve` | Resolves up to 500 track IDs for playback handoff |
 | `GET /api/v1/catalog/tracks/:id/lyrics` | Embedded lyrics from indexed audio tags; returns `lyrics_not_found` when absent |
-| `GET /api/v1/playback/state` · `POST /api/v1/playback/poll` | Account-scoped connected devices and the active playback session |
-| `POST /api/v1/playback/handoff` · `POST /api/v1/playback/commands` | Transfers playback or queues a command for the active device |
-| `POST /api/v1/playback/commands/:commandId/ack` | Acknowledges remote command execution |
+| `GET /api/v1/playback/state` · `POST /api/v1/playback/poll` | Account-scoped device registry and versioned playback session |
+| `WS /api/v1/playback/socket` | Authenticated realtime session sync and command delivery |
+| `POST /api/v1/playback/handoff` · `GET /api/v1/playback/transfers/:id` | Prepare, acknowledge and inspect a playback transfer |
+| `POST /api/v1/playback/commands` · `GET/DELETE /api/v1/playback/commands/:id` | Queue, inspect or cancel an acknowledged remote command |
+| `POST /api/v1/playback/commands/:commandId/ack` | Acknowledge remote command execution or transfer preparation |
+| `PATCH /api/v1/playback/devices/:deviceId` · `POST .../:deviceId/disconnect` · `DELETE /api/v1/playback/devices/:deviceId` | Rename, hide/disconnect this device, or forget an offline device |
 | `GET /api/v1/artists` · `GET /api/v1/artists/:id/*` | Indexed artist aggregates, tracks and albums |
 | `GET /api/v1/albums` · `GET /api/v1/albums/:id/*` | Indexed album aggregates and ordered tracks |
 | `GET /api/v1/genres` · `GET /api/v1/genres/:id/tracks` | Indexed genres and matching tracks |
@@ -52,10 +55,34 @@ accepts only a valid, database-backed, one-use state bound to the initiating
 user.
 
 Connected playback requires a signed-in personal account; owner-token mode is
-not accepted. Active devices heartbeat every two seconds and are considered
-offline after 20 seconds without a poll. Handoff transfers the queue and
-playback position, and the receiving device resolves track IDs into fresh
-stream tickets. Queues are capped at 500 tracks.
+not accepted. Clients connect to `/api/v1/playback/socket` using the account
+session token in the first WebSocket frame (never in the URL). Authenticated
+WebSocket heartbeats carry player snapshots and receive session changes and
+commands in real time. The HTTP polling API remains as a reconnect and
+cross-instance fallback; devices are considered offline after 20 seconds
+without a heartbeat. Commands are acknowledged, have bounded lifetimes, and
+can be cancelled if they time out. A transfer keeps the source authoritative
+until the online target resolves the queue and acknowledges that it has
+prepared the requested track. A failed transfer leaves the source active. The
+target resolves track IDs into fresh stream tickets; queue revisions prevent a
+transfer from switching to a stale queue. Queues are capped at 500 tracks, and
+active-player volume is synchronized when the player reports it. Devices can
+be renamed and hidden from other clients on the same account; stale offline
+entries can be forgotten.
+
+Vercel WebSocket support requires Fluid Compute. Connections close when the
+Function reaches its configured maximum duration, so clients reconnect with
+backoff and resynchronize from MongoDB. Configure the Vercel Upstash Redis
+integration and its `REDIS_URL` environment variable to relay lightweight
+playback-change notifications between Function instances. Without Redis,
+clients continue using HTTP polling for reliable cross-instance sync.
+
+Discovery is account-based, so authenticated GMusic clients can find each
+other across networks. This registry does not discover third-party speakers or
+TVs: those endpoints need their own GMusic playback client and authenticated
+heartbeat. Local mDNS, QR pairing and multi-room playback are not provided;
+multi-room requires a separate synchronized-player design. The backend does
+not proxy audio through a controller device.
 
 Ticketed and authenticated media routes allow cross-origin resource loading so
 the Flutter web app can play audio and display artwork from a separate local

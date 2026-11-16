@@ -1,6 +1,5 @@
-// Vercel serverless entry. Every route (rewritten from vercel.json) is
-// handled by this Express app; @vercel/node treats the default export as the
-// request handler. Module init is top-level, so it runs once per cold start.
-import app from '../src/server.js';
+// Vercel's Node runtime exports the HTTP server so the same function can
+// handle Express requests and WebSocket upgrades.
+import server from '../src/server.js';
 
-export default app;
+export default server;

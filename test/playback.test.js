@@ -16,6 +16,7 @@ class MemoryCollection {
       if (expected && typeof expected === 'object' && !Array.isArray(expected)) {
         if ('$gt' in expected) return actual > expected.$gt;
         if ('$gte' in expected) return actual >= expected.$gte;
+        if ('$lte' in expected) return actual <= expected.$lte;
         if ('$in' in expected) return expected.$in.includes(actual);
       }
       if (actual instanceof ObjectId && expected instanceof ObjectId) {
@@ -55,6 +56,13 @@ class MemoryCollection {
     return { insertedId: inserted._id };
   }
 
+  async deleteOne(filter) {
+    const index = this.documents.findIndex((document) => this.matches(document, filter));
+    if (index < 0) return { deletedCount: 0 };
+    this.documents.splice(index, 1);
+    return { deletedCount: 1 };
+  }
+
   find(filter) {
     let rows = this.documents.filter((document) => this.matches(document, filter));
     return {
@@ -86,6 +94,7 @@ class MemoryDatabase {
 test('playback polling, handoff, commands, and device visibility are account-scoped', async () => {
   const database = new MemoryDatabase();
   const app = express();
+  let testTime = new Date('2026-11-16T00:00:00.000Z');
   app.use(express.json());
   app.use((req, _res, next) => {
     req.user = { id: req.get('x-user-id') || 'user-a' };
@@ -93,7 +102,7 @@ test('playback polling, handoff, commands, and device visibility are account-sco
   });
   app.use(createPlaybackRouter({
     collection: (name) => database.collection(name),
-    now: () => new Date('2026-11-16T00:00:00.000Z'),
+    now: () => testTime,
   }));
   app.use((error, _req, res, _next) => {
     res.status(error.status || 500).json({ error: error.code || 'internal_error' });
@@ -150,13 +159,118 @@ test('playback polling, handoff, commands, and device visibility are account-sco
     });
     assert.equal(secondPoll.response.status, 200);
 
-    const handoff = await request('/playback/handoff', {
+    const failedTransfer = await request('/playback/handoff', {
       method: 'POST',
       body: { deviceId: deviceB },
     });
-    assert.equal(handoff.response.status, 200);
-    assert.equal(handoff.body.session.activeDeviceId, deviceB);
-    assert.deepEqual(handoff.body.session.trackIds, snapshot.trackIds);
+    assert.equal(failedTransfer.response.status, 202);
+    assert.equal(failedTransfer.body.status, 'pending');
+    assert.equal(
+      (await request('/playback/state')).body.session.activeDeviceId,
+      deviceA,
+    );
+    const failedHandoffPoll = await request('/playback/poll', {
+      method: 'POST',
+      body: { deviceId: deviceB, name: 'Android • B', platform: 'android' },
+    });
+    const failedHandoffCommand = failedHandoffPoll.body.commands.find(
+      ({ action, payload }) =>
+        action === 'handoff' &&
+        payload.transferId === failedTransfer.body.transferId,
+    );
+    const failedAck = await request(
+      `/playback/commands/${failedHandoffCommand.id}/ack`,
+      {
+        method: 'POST',
+        body: {
+          deviceId: deviceB,
+          status: 'failed',
+          error: 'track_unavailable',
+        },
+      },
+    );
+    assert.equal(failedAck.body.transferStatus, 'failed');
+    assert.equal(
+      (await request(`/playback/transfers/${failedTransfer.body.transferId}`))
+        .body.status,
+      'failed',
+    );
+    assert.equal(
+      (await request('/playback/state')).body.session.activeDeviceId,
+      deviceA,
+    );
+
+    const staleTransfer = await request('/playback/handoff', {
+      method: 'POST',
+      body: { deviceId: deviceB },
+    });
+    const changedSnapshot = { ...snapshot, index: 1 };
+    const changedPoll = await request('/playback/poll', {
+      method: 'POST',
+      body: {
+        deviceId: deviceA,
+        name: 'Android • A',
+        platform: 'android',
+        snapshot: changedSnapshot,
+      },
+    });
+    assert.equal(changedPoll.response.status, 200);
+    assert.equal(changedPoll.body.session.index, 1);
+    const staleHandoffPoll = await request('/playback/poll', {
+      method: 'POST',
+      body: { deviceId: deviceB, name: 'Android • B', platform: 'android' },
+    });
+    const staleHandoffCommand = staleHandoffPoll.body.commands.find(
+      ({ action, payload }) =>
+        action === 'handoff' &&
+        payload.transferId === staleTransfer.body.transferId,
+    );
+    assert.equal(
+      changedPoll.body.session.queueRevision,
+      staleHandoffCommand.payload.session.queueRevision + 1,
+    );
+    const staleAck = await request(
+      `/playback/commands/${staleHandoffCommand.id}/ack`,
+      {
+        method: 'POST',
+        body: { deviceId: deviceB, status: 'ok' },
+      },
+    );
+    assert.equal(staleAck.body.transferStatus, 'failed');
+    assert.equal(
+      (await request(`/playback/transfers/${staleTransfer.body.transferId}`))
+        .body.error,
+      'playback_changed',
+    );
+    const unchangedOwner = (await request('/playback/state')).body.session;
+    assert.equal(unchangedOwner.activeDeviceId, deviceA);
+    assert.equal(unchangedOwner.index, 1);
+
+    const retry = await request('/playback/handoff', {
+      method: 'POST',
+      body: { deviceId: deviceB },
+    });
+    const handoffPoll = await request('/playback/poll', {
+      method: 'POST',
+      body: { deviceId: deviceB, name: 'Android • B', platform: 'android' },
+    });
+    const handoffCommand = handoffPoll.body.commands.find(
+      ({ action, payload }) =>
+        action === 'handoff' && payload.transferId === retry.body.transferId,
+    );
+    assert.ok(handoffCommand);
+    assert.deepEqual(handoffCommand.payload.session.trackIds, snapshot.trackIds);
+    const handoffAck = await request(`/playback/commands/${handoffCommand.id}/ack`, {
+      method: 'POST',
+      body: { deviceId: deviceB, status: 'ok' },
+    });
+    assert.equal(handoffAck.response.status, 200);
+    assert.equal(handoffAck.body.transferStatus, 'completed');
+    const transfer = await request(`/playback/transfers/${retry.body.transferId}`);
+    assert.equal(transfer.body.status, 'completed');
+    const handedOffState = await request('/playback/state');
+    assert.equal(handedOffState.body.session.activeDeviceId, deviceB);
+    assert.deepEqual(handedOffState.body.session.trackIds, snapshot.trackIds);
 
     const invalidQueueCommand = await request('/playback/commands', {
       method: 'POST',
@@ -175,21 +289,82 @@ test('playback polling, handoff, commands, and device visibility are account-sco
       method: 'POST',
       body: { deviceId: deviceB, name: 'Android • B', platform: 'android' },
     });
-    assert.deepEqual(
-      targetPoll.body.commands.map(({ action, payload }) => [action, payload]),
-      [['seek', { positionMs: 9000 }]],
-    );
+    assert.deepEqual(targetPoll.body.commands.map(({ action, payload }) => [action, payload]), [
+      ['seek', { positionMs: 9000 }],
+    ]);
 
     const ack = await request(`/playback/commands/${targetPoll.body.commands[0].id}/ack`, {
       method: 'POST',
       body: { deviceId: deviceB, status: 'ok' },
     });
     assert.equal(ack.response.status, 200);
+    const commandStatus = await request(
+      `/playback/commands/${queuedCommand.body.commandId}`,
+    );
+    assert.equal(commandStatus.body.status, 'ok');
+
+    const pendingCommand = await request('/playback/commands', {
+      method: 'POST',
+      body: { action: 'pause' },
+    });
+    const cancellation = await request(
+      `/playback/commands/${pendingCommand.body.commandId}`,
+      { method: 'DELETE' },
+    );
+    assert.equal(cancellation.response.status, 200);
+    assert.equal(
+      (
+        await request(`/playback/commands/${pendingCommand.body.commandId}`)
+      ).body.status,
+      'cancelled',
+    );
+
+    const expiringCommand = await request('/playback/commands', {
+      method: 'POST',
+      body: { action: 'pause' },
+    });
+    testTime = new Date(testTime.getTime() + 61_000);
+    const lateAck = await request(
+      `/playback/commands/${expiringCommand.body.commandId}/ack`,
+      {
+        method: 'POST',
+        body: { deviceId: deviceB, status: 'ok' },
+      },
+    );
+    assert.equal(lateAck.response.status, 409);
+    assert.equal(lateAck.body.error, 'command_expired');
+    const expiredStatus = await request(
+      `/playback/commands/${expiringCommand.body.commandId}`,
+    );
+    assert.equal(expiredStatus.body.status, 'failed');
+    assert.equal(expiredStatus.body.error, 'command_timeout');
 
     const otherAccount = await request('/playback/state', { user: 'user-b' });
     assert.equal(otherAccount.response.status, 200);
     assert.equal(otherAccount.body.session, null);
     assert.deepEqual(otherAccount.body.devices, []);
+
+    const rename = await request(`/playback/devices/${deviceB}`, {
+      method: 'PATCH',
+      body: { name: 'Office PC', visible: false },
+    });
+    assert.equal(rename.response.status, 200);
+    assert.equal(rename.body.name, 'Office PC');
+    assert.equal(rename.body.visible, false);
+    assert.equal(
+      (await request('/playback/state')).body.devices.some(
+        ({ deviceId }) => deviceId === deviceB,
+      ),
+      false,
+    );
+    testTime = new Date(testTime.getTime() + 21_000);
+    const stalePlayback = await request('/playback/state');
+    assert.equal(stalePlayback.body.session.playing, false);
+    assert.equal(
+      stalePlayback.body.devices.find(({ deviceId }) => deviceId === deviceA)
+        ?.online,
+      false,
+    );
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

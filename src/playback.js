@@ -44,6 +44,18 @@ function apiError(status, code) {
   return error;
 }
 
+function groupClaimExpired(device, time) {
+  return Boolean(
+    device?.groupSessionId &&
+    device.groupSessionExpiresAt &&
+    new Date(device.groupSessionExpiresAt).getTime() <= time.getTime(),
+  );
+}
+
+function deviceInGroupSession(device, time) {
+  return Boolean(device?.groupSessionId && !groupClaimExpired(device, time));
+}
+
 function commandDeadline(command) {
   return command.deadlineAt || command.expiresAt;
 }
@@ -390,7 +402,14 @@ export async function pollPlayback({
   const devices = collection('playback_devices');
   const sessions = collection('playback_sessions');
   const commands = collection('playback_commands');
-  const existingDevice = await devices.findOne({ userId, deviceId });
+  let existingDevice = await devices.findOne({ userId, deviceId });
+  if (groupClaimExpired(existingDevice, time)) {
+    await devices.updateOne(
+      { userId, deviceId, groupSessionId: existingDevice.groupSessionId },
+      { $unset: { groupSessionId: '', groupSessionExpiresAt: '' } },
+    );
+    existingDevice = { ...existingDevice, groupSessionId: null };
+  }
   await devices.updateOne(
     { userId, deviceId },
     {
@@ -409,7 +428,7 @@ export async function pollPlayback({
   let session = await sessions.findOne({ _id: userId });
   const initialRevision = session?.revision || 0;
   session = await pauseExpiredPlayback(collection, userId, session, time);
-  if (claim) {
+  if (!existingDevice?.groupSessionId && claim) {
     if (!snapshot?.trackIds.length || !snapshot.playing) {
       throw apiError(400, 'invalid_playback_claim');
     }
@@ -431,6 +450,7 @@ export async function pollPlayback({
       );
     }
   } else if (
+    !existingDevice?.groupSessionId &&
     snapshot &&
     session?.activeDeviceId === deviceId &&
     (snapshot.playbackEpoch === undefined ||
@@ -450,16 +470,18 @@ export async function pollPlayback({
     );
   }
   session = await sessions.findOne({ _id: userId });
-  const pending = await commands
-    .find({
-      userId,
-      deviceId,
-      status: 'pending',
-      ...commandDeadlineFilter('$gt', time),
-    })
-    .sort({ createdAt: 1 })
-    .limit(20)
-    .toArray();
+  const pending = existingDevice?.groupSessionId
+    ? []
+    : await commands
+      .find({
+        userId,
+        deviceId,
+        status: 'pending',
+        ...commandDeadlineFilter('$gt', time),
+      })
+      .sort({ createdAt: 1 })
+      .limit(20)
+      .toArray();
   const activeDevices = await devices.find({ userId })
     .sort({ lastSeenAt: -1 })
     .limit(50)
@@ -487,6 +509,77 @@ export async function pollPlayback({
       createdAt: command.createdAt,
     })),
   };
+}
+
+export async function claimPlaybackDeviceForGroup({
+  userId,
+  deviceId,
+  groupSessionId,
+  groupSessionExpiresAt,
+  collection = col,
+  now = () => new Date(),
+}) {
+  const time = now();
+  const result = await collection('playback_devices').updateOne(
+    {
+      userId,
+      deviceId,
+      lastSeenAt: { $gte: new Date(time.getTime() - DEVICE_ONLINE_MS) },
+      $or: [
+        { groupSessionId: { $exists: false } },
+        { groupSessionId: null },
+        { groupSessionId },
+        { groupSessionExpiresAt: { $lte: time } },
+      ],
+    },
+    { $set: { groupSessionId, groupSessionExpiresAt } },
+  );
+  if (!result.matchedCount) throw apiError(409, 'device_unavailable');
+
+  const pendingCommands = await collection('playback_commands')
+    .find({ userId, deviceId, status: 'pending' })
+    .toArray();
+  await Promise.all(pendingCommands.map((command) =>
+    collection('playback_commands').updateOne(
+      { _id: command._id, userId, status: 'pending' },
+      { $set: { status: 'cancelled', cancelledAt: time } },
+    )));
+  const pendingTransfers = await collection('playback_transfers')
+    .find({ userId, targetDeviceId: deviceId, status: 'pending' })
+    .toArray();
+  await Promise.all(pendingTransfers.map((transfer) =>
+    collection('playback_transfers').updateOne(
+      { _id: transfer._id, userId, status: 'pending' },
+      {
+        $set: {
+          status: 'failed',
+          error: 'device_in_group_session',
+          completedAt: time,
+        },
+      },
+    )));
+
+  const session = await collection('playback_sessions').findOne({ _id: userId });
+  if (session?.activeDeviceId === deviceId) {
+    await updateSession(
+      collection('playback_sessions'),
+      userId,
+      { activeDeviceId: null, playing: false, resumeOnFailover: false },
+      { updatedAt: time },
+    );
+  }
+}
+
+export async function releasePlaybackDeviceFromGroup({
+  userId,
+  deviceId,
+  groupSessionId,
+  collection = col,
+}) {
+  await collection('playback_devices').updateOne(
+    { userId, deviceId, groupSessionId },
+    { $unset: { groupSessionId: '', groupSessionExpiresAt: '' } },
+  );
 }
 
 export async function createPlaybackCommand({
@@ -552,6 +645,9 @@ export async function createPlaybackCommand({
     lastSeenAt: { $gte: new Date(now().getTime() - DEVICE_ONLINE_MS) },
   });
   if (!device) throw apiError(409, 'device_offline');
+  if (deviceInGroupSession(device, now())) {
+    throw apiError(409, 'device_in_group_session');
+  }
   const requiredCapability = commandAction === 'volume'
     ? 'volume'
     : commandAction === 'seek'
@@ -616,6 +712,9 @@ export async function createPlaybackHandoff({
     lastSeenAt: { $gte: new Date(time.getTime() - DEVICE_ONLINE_MS) },
   });
   if (!target) throw apiError(409, 'device_offline');
+  if (deviceInGroupSession(target, time)) {
+    throw apiError(409, 'device_in_group_session');
+  }
   if (target.capabilities?.playback === false) {
     throw apiError(409, 'device_restricted');
   }
@@ -800,6 +899,8 @@ export async function acknowledgePlaybackCommand({
           (currentSession.queueRevision || 0) !== transfer.queueRevision
         ) {
           transferError = 'playback_changed';
+        } else if (deviceInGroupSession(target, acknowledgedAt)) {
+          transferError = 'device_in_group_session';
         } else if (!source) {
           try {
             await updateSession(
@@ -813,14 +914,31 @@ export async function acknowledgePlaybackCommand({
               },
               { updatedAt: now() },
             );
+            const claimedTarget = await collection('playback_devices')
+              .findOne({ userId, deviceId });
+            if (deviceInGroupSession(claimedTarget, now())) {
+              const sessionAfterClaim = await collection('playback_sessions')
+                .findOne({ _id: userId });
+              if (sessionAfterClaim?.activeDeviceId === deviceId) {
+                await updateSession(
+                  collection('playback_sessions'),
+                  userId,
+                  { activeDeviceId: null, playing: false },
+                  { updatedAt: now() },
+                );
+              }
+              transferError = 'device_in_group_session';
+            }
+          } catch (updateError) {
+            if (updateError.code !== 'playback_conflict') throw updateError;
+            transferError = 'playback_changed';
+          }
+          if (!transferError) {
             transferStatus = 'completed';
             await transfers.updateOne(
               { _id: transferId, userId, status: 'pending' },
               { $set: { status: transferStatus, completedAt: now() } },
             );
-          } catch (updateError) {
-            if (updateError.code !== 'playback_conflict') throw updateError;
-            transferError = 'playback_changed';
           }
         } else {
           const pauseCommandId = new ObjectId();
@@ -895,6 +1013,9 @@ export async function acknowledgePlaybackCommand({
             },
           });
           if (!target) transferError = 'device_offline';
+          else if (deviceInGroupSession(target, now())) {
+            transferError = 'device_in_group_session';
+          }
           else if (
             currentSession?.activeDeviceId !== transfer.sourceDeviceId ||
             (currentSession.queueRevision || 0) !== transfer.queueRevision
@@ -913,6 +1034,26 @@ export async function acknowledgePlaybackCommand({
                 },
                 { updatedAt: now() },
               );
+              const claimedTarget = await collection('playback_devices')
+                .findOne({
+                  userId,
+                  deviceId: transfer.targetDeviceId,
+                });
+              if (deviceInGroupSession(claimedTarget, now())) {
+                const sessionAfterClaim = await collection('playback_sessions')
+                  .findOne({ _id: userId });
+                if (
+                  sessionAfterClaim?.activeDeviceId === transfer.targetDeviceId
+                ) {
+                  await updateSession(
+                    collection('playback_sessions'),
+                    userId,
+                    { activeDeviceId: null, playing: false },
+                    { updatedAt: now() },
+                  );
+                }
+                transferError = 'device_in_group_session';
+              }
             } catch (updateError) {
               if (updateError.code !== 'playback_conflict') throw updateError;
               transferError = 'playback_changed';
@@ -1091,6 +1232,9 @@ export function createPlaybackRouter({
         res.json({ ok: true });
         return;
       }
+      if (deviceInGroupSession(device, now())) {
+        throw apiError(409, 'device_in_group_session');
+      }
       await devices.deleteOne({ userId: req.user.id, deviceId });
       const session = await collection('playback_sessions').findOne({ _id: req.user.id });
       let updatedSession = session;
@@ -1121,6 +1265,9 @@ export function createPlaybackRouter({
       if (!device) {
         res.json({ ok: true });
         return;
+      }
+      if (deviceInGroupSession(device, time)) {
+        throw apiError(409, 'device_in_group_session');
       }
       const time = now();
       if (time.getTime() - new Date(device.lastSeenAt).getTime() <= DEVICE_ONLINE_MS) {

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import express from 'express';
 import { createServer } from 'node:http';
 import { ObjectId } from 'mongodb';
-import { createPlaybackRouter } from '../src/playback.js';
+import { createPlaybackRouter, pollPlayback } from '../src/playback.js';
 
 class MemoryCollection {
   constructor() {
@@ -50,6 +50,7 @@ class MemoryCollection {
     if (!document) return { matchedCount: 0 };
     if (!matchedCount) Object.assign(document, update.$setOnInsert || {});
     Object.assign(document, update.$set || {});
+    for (const key of Object.keys(update.$unset || {})) delete document[key];
     for (const [key, increment] of Object.entries(update.$inc || {})) {
       document[key] = (document[key] || 0) + increment;
     }
@@ -96,6 +97,51 @@ class MemoryDatabase {
     return this.collections.get(name);
   }
 }
+
+test('playback polling releases an expired group claim before personal playback claims the device', async () => {
+  const database = new MemoryDatabase();
+  const time = new Date('2026-11-18T00:00:00.000Z');
+  const deviceId = '0123456789abcdef0123456789abcdef';
+  await database.collection('playback_devices').insertOne({
+    userId: 'user-a',
+    deviceId,
+    name: 'Phone',
+    platform: 'android',
+    lastSeenAt: time,
+    groupSessionId: 'expired-room',
+    groupSessionExpiresAt: new Date(time.getTime() - 1),
+  });
+
+  const result = await pollPlayback({
+    userId: 'user-a',
+    collection: (name) => database.collection(name),
+    now: () => time,
+    body: {
+      deviceId,
+      name: 'Phone',
+      platform: 'android',
+      claim: true,
+      snapshot: {
+        trackIds: ['track-a'],
+        index: 0,
+        positionMs: 0,
+        durationMs: 60_000,
+        volume: 1,
+        playing: true,
+        shuffle: false,
+        repeat: 'none',
+      },
+    },
+  });
+
+  assert.equal(result.session.activeDeviceId, deviceId);
+  const device = await database.collection('playback_devices').findOne({
+    userId: 'user-a',
+    deviceId,
+  });
+  assert.equal(device.groupSessionId, undefined);
+  assert.equal(device.groupSessionExpiresAt, undefined);
+});
 
 test('playback polling, handoff, commands, and device visibility are account-scoped', async () => {
   const database = new MemoryDatabase();

@@ -31,6 +31,9 @@ OAuth client secret anywhere but this service.
 | `POST /api/v1/playback/commands` · `GET/DELETE /api/v1/playback/commands/:id` | Queue, inspect or cancel an acknowledged remote command |
 | `POST /api/v1/playback/commands/:commandId/ack` | Acknowledge remote command execution or transfer preparation |
 | `PATCH /api/v1/playback/devices/:deviceId` · `POST .../:deviceId/disconnect` · `DELETE /api/v1/playback/devices/:deviceId` | Rename, hide/disconnect this device, or forget an offline device |
+| `POST /api/v1/group-listening` · `POST /api/v1/group-listening/join` | Create a Group Listening room or join by invitation code |
+| `GET /api/v1/group-listening/:sessionId` · `POST .../:sessionId/heartbeat` | Fetch room state or report readiness, clock offset, playback position and output-latency compensation |
+| `POST /api/v1/group-listening/:sessionId/control` · `POST .../:sessionId/leave` | Control shared playback/queue or leave the room |
 | `GET /api/v1/artists` · `GET /api/v1/artists/:id/*` | Indexed artist aggregates, tracks and albums |
 | `GET /api/v1/albums` · `GET /api/v1/albums/:id/*` | Indexed album aggregates and ordered tracks |
 | `GET /api/v1/genres` · `GET /api/v1/genres/:id/tracks` | Indexed genres and matching tracks |
@@ -88,6 +91,23 @@ the queue and acknowledges preparation. A failed transfer leaves the source
 active. Queue revisions reject stale queue operations and prevent transfers
 from switching to a stale queue. Queues are capped at 500 tracks.
 
+Group Listening is separate from the account-level Connected Playback session.
+Rooms have their own shared queue and timeline, support up to 20 participants,
+and expire after 24 hours. Every joining account must be able to access every
+track in the shared queue. Clients reuse the authenticated playback Socket.IO
+connection (`group:watch`, `group:unwatch`, `group:clock`, and `group:changed`)
+and the existing Redis adapter, while MongoDB remains authoritative for room
+state. The backend schedules a common future start after active members report
+that they are ready; clients estimate server-clock offset and correct playback
+drift locally. This is best-effort synchronization, not sample-accurate or
+acoustic-latency synchronization over arbitrary devices and networks.
+
+A device claimed by a group cannot be targeted by Connected Playback commands,
+handoffs, or device disconnect/forget operations. Its personal account session
+is suspended on entry; leaving restores the saved personal queue paused. A
+room's 24-hour expiry also expires its device claim, allowing Connected
+Playback to reclaim a device after its next heartbeat.
+
 Vercel WebSocket support requires Fluid Compute. The dedicated Socket.IO
 Function is configured for a 300-second maximum duration; connections still
 close at that limit, so clients reconnect with backoff and resynchronize from
@@ -99,9 +119,8 @@ the health response reports that state and clients continue with REST polling.
 Discovery is account-based, so authenticated GMusic clients can find each
 other across networks. This registry does not discover third-party speakers or
 TVs: those endpoints need their own GMusic playback client and authenticated
-heartbeat. Local mDNS, QR pairing and multi-room playback are not provided;
-multi-room requires a separate synchronized-player design. The backend does
-not proxy audio through a controller device.
+heartbeat. Local mDNS and QR pairing are not provided. The backend does not
+proxy audio through a controller device.
 
 Ticketed and authenticated media routes allow cross-origin resource loading so
 the Flutter web app can play audio and display artwork from a separate local

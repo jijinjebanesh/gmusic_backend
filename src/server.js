@@ -7,6 +7,7 @@ import { readInstalledCredentials, createDriveSession, createDisabledDrive } fro
 import { col, initDb, mongoEnabled } from './db.js';
 import { authRoutes, userDataRoutes, attachUser } from './auth.js';
 import { playbackRoutes } from './playback.js';
+import { createGroupListeningRouter } from './group_listening.js';
 import {
   playbackEventsAreShared,
   playbackRedisStatus,
@@ -222,6 +223,10 @@ app.get('/api/v1/drive/oauth/callback', async (req, res) => {
 app.use('/api/v1', attachUser(apiToken));
 app.use('/api/v1', userDataRoutes);
 app.use('/api/v1', playbackRoutes);
+app.use('/api/v1', createGroupListeningRouter({
+  getAccessibleTracks: async (req, ids) =>
+    getTracksByIds(ids, driveOwner(req)),
+}));
 app.get('/api/v1/status', async (req, res, next) => {
   try {
     const connection = driveMode === 'shared'

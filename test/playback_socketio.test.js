@@ -2,9 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
+import { ObjectId } from 'mongodb';
 import { io as createClient } from 'socket.io-client';
 import { attachPlaybackSocketIO } from '../src/playback_socketio.js';
-import { publishPlaybackEvent } from '../src/playback_event_bus.js';
+import {
+  publishGroupEvent,
+  publishPlaybackEvent,
+} from '../src/playback_event_bus.js';
 
 const DEVICE_A = '0123456789abcdef0123456789abcdef';
 const DEVICE_B = 'abcdef0123456789abcdef0123456789';
@@ -192,6 +196,95 @@ test('Socket.IO rejects invalid session tokens before device registration', asyn
     assert.equal(error.message, 'session_expired');
   } finally {
     client.disconnect();
+    await close(socketServer.io);
+  }
+});
+
+test('group Socket.IO rooms are available only to registered room members', async () => {
+  const server = createServer();
+  const sessionId = new ObjectId();
+  const time = new Date();
+  const room = {
+    _id: sessionId,
+    title: 'Private room',
+    code: 'ABCDEFGH',
+    status: 'paused',
+    trackIds: ['track-a'],
+    index: 0,
+    positionMs: 0,
+    playing: false,
+    stateVersion: 1,
+    queueRevision: 1,
+    expiresAt: new Date(time.getTime() + 60_000),
+    hostMemberId: 'member-a',
+    members: [{
+      memberId: 'member-a',
+      userId: 'user-a',
+      deviceId: DEVICE_A,
+      name: 'Phone',
+      platform: 'android',
+      joinedAt: time,
+      lastSeenAt: time,
+      ready: false,
+    }],
+  };
+  const collection = (name) => ({
+    findOne: async (filter) => {
+      if (name !== 'group_listening_sessions' ||
+          !filter._id?.equals(sessionId) ||
+          (filter.expiresAt?.$gt &&
+            room.expiresAt <= filter.expiresAt.$gt)) {
+        return null;
+      }
+      return room;
+    },
+  });
+  const socketServer = attachPlaybackSocketIO(server, {
+    apiToken: 'api-token',
+    collection,
+    now: () => time,
+    configureEventBus: () => false,
+    authenticate: async (token) => ({
+      user: { id: token === 'token-b' ? 'user-b' : 'user-a' },
+      ownerMode: false,
+    }),
+    poll: async () => ({ session: null, devices: [], commands: [] }),
+  });
+  const origin = await listen(server);
+  const member = connect(origin);
+  const outsider = connect(origin, 'token-b');
+  try {
+    await Promise.all([once(member, 'connect'), once(outsider, 'connect')]);
+    await Promise.all([
+      ack(member, 'device:register', {
+        device: { deviceId: DEVICE_A, name: 'Phone', platform: 'android' },
+      }),
+      ack(outsider, 'device:register', {
+        device: { deviceId: DEVICE_B, name: 'Browser', platform: 'web' },
+      }),
+    ]);
+
+    const authorized = await ack(member, 'group:watch', {
+      sessionId: String(sessionId),
+    });
+    const denied = await ack(outsider, 'group:watch', {
+      sessionId: String(sessionId),
+    });
+    assert.equal(authorized.ok, true, JSON.stringify(authorized));
+    assert.equal(denied.ok, false);
+    assert.equal(denied.error, 'not_a_group_member');
+
+    const groupUpdate = once(member, 'group:changed');
+    let outsiderReceivedUpdate = false;
+    outsider.once('group:changed', () => { outsiderReceivedUpdate = true; });
+    publishGroupEvent(String(sessionId), { room: { sessionId: String(sessionId) } });
+    const [update] = await groupUpdate;
+    assert.equal(update.room.sessionId, String(sessionId));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(outsiderReceivedUpdate, false);
+  } finally {
+    member.disconnect();
+    outsider.disconnect();
     await close(socketServer.io);
   }
 });

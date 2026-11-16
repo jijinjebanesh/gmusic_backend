@@ -91,6 +91,10 @@ async function ensureIndexes() {
   const playbackTransfers = db.collection('playback_transfers');
   await playbackTransfers.createIndex({ userId: 1, createdAt: -1 });
   await playbackTransfers.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+  const groupSessions = db.collection('group_listening_sessions');
+  await groupSessions.createIndex({ code: 1 }, { unique: true });
+  await groupSessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+  await groupSessions.createIndex({ 'members.userId': 1, 'members.deviceId': 1 });
 }
 
 export async function closeDb() {

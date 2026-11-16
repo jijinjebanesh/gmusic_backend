@@ -16,6 +16,7 @@ import {
   createPlaybackHandoff,
   pollPlayback,
 } from './playback.js';
+import { attachGroupListeningSocketHandlers } from './group_listening.js';
 
 const SOCKET_PATH = '/api/v1/playback/socket';
 const AUTH_TIMEOUT_MS = 5_000;
@@ -88,6 +89,9 @@ const SUPPORTED_EVENTS = new Set([
   'playback:command',
   'playback:transfer',
   'playback:command:ack',
+  'group:watch',
+  'group:unwatch',
+  'group:clock',
 ]);
 
 function roomForCommand(userId, commandId) {
@@ -264,6 +268,7 @@ export function attachPlaybackSocketIO(server, {
           capabilities: input.device.capabilities,
           visible: input.device.visible,
         };
+        socket.data.deviceId = device.deviceId;
         await socket.join(userRoom(socket.data.userId));
         await socket.join(deviceRoom(socket.data.userId, device.deviceId));
         const result = await sync(input.snapshot ?? null, input.claim === true);
@@ -378,6 +383,8 @@ export function attachPlaybackSocketIO(server, {
     });
     socket.on('error', onConnectionError);
   });
+
+  attachGroupListeningSocketHandlers(io, { collection, now });
 
   return {
     io,

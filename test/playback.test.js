@@ -365,6 +365,43 @@ test('playback polling, handoff, commands, and device visibility are account-sco
         ?.online,
       false,
     );
+    assert.equal(
+      database.collection('playback_sessions').documents[0].resumeOnFailover,
+      true,
+    );
+
+    await request('/playback/poll', {
+      method: 'POST',
+      body: { deviceId: deviceA, name: 'Android • A', platform: 'android' },
+    });
+    const failover = await request('/playback/handoff', {
+      method: 'POST',
+      body: { deviceId: deviceA },
+    });
+    const failoverCommandPoll = await request('/playback/poll', {
+      method: 'POST',
+      body: { deviceId: deviceA, name: 'Android • A', platform: 'android' },
+    });
+    const failoverCommand = failoverCommandPoll.body.commands.find(
+      ({ action, payload }) =>
+        action === 'handoff' && payload.transferId === failover.body.transferId,
+    );
+    assert.equal(failoverCommand.payload.session.playing, true);
+    const failoverAck = await request(
+      `/playback/commands/${failoverCommand.id}/ack`,
+      {
+        method: 'POST',
+        body: { deviceId: deviceA, status: 'ok' },
+      },
+    );
+    assert.equal(failoverAck.body.transferStatus, 'completed');
+    const resumedSession = (await request('/playback/state')).body.session;
+    assert.equal(resumedSession.activeDeviceId, deviceA);
+    assert.equal(resumedSession.playing, true);
+    assert.equal(
+      database.collection('playback_sessions').documents[0].resumeOnFailover,
+      false,
+    );
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

@@ -3,7 +3,7 @@ import { ObjectId } from 'mongodb';
 import { col } from './db.js';
 import { publishPlaybackEvent } from './playback_event_bus.js';
 
-const DEVICE_ONLINE_MS = 20_000;
+const DEVICE_ONLINE_MS = 12_000;
 const COMMAND_TTL_MS = 60_000;
 const TRANSFER_TTL_MS = 30_000;
 const MAX_QUEUE_SIZE = 500;
@@ -133,6 +133,7 @@ function sessionFields(snapshot) {
     repeat: snapshot.repeat,
     title: snapshot.title,
     artist: snapshot.artist,
+    resumeOnFailover: false,
   };
 }
 
@@ -203,6 +204,7 @@ async function ensureSession(sessions, userId, now) {
         queueRevision: 0,
         revision: 0,
         lastTransferId: null,
+        resumeOnFailover: false,
         createdAt: now,
         updatedAt: now,
       },
@@ -260,7 +262,7 @@ async function pauseExpiredPlayback(collection, userId, session, time) {
   return updateSession(
     collection('playback_sessions'),
     userId,
-    { playing: false },
+    { playing: false, resumeOnFailover: true },
     { updatedAt: time },
   );
 }
@@ -482,12 +484,15 @@ export function createPlaybackRouter({
       }
       const transferId = new ObjectId();
       const expiresAt = new Date(time.getTime() + TRANSFER_TTL_MS);
+      const resumePlayback =
+        session.playing === true || session.resumeOnFailover === true;
       const transfer = {
         _id: transferId,
         userId,
         sourceDeviceId: session.activeDeviceId,
         targetDeviceId: deviceId,
         queueRevision: session.queueRevision || 0,
+        resumePlayback,
         status: 'pending',
         createdAt: time,
         expiresAt,
@@ -499,7 +504,7 @@ export function createPlaybackRouter({
         action: 'handoff',
         payload: {
           transferId: String(transferId),
-          session: publicSession(session),
+          session: publicSession({ ...session, playing: resumePlayback }),
         },
         status: 'pending',
         createdAt: time,
@@ -831,6 +836,8 @@ export function createPlaybackRouter({
                   {
                     activeDeviceId: deviceId,
                     lastTransferId: String(transferId),
+                    playing: transfer.resumePlayback === true,
+                    resumeOnFailover: false,
                   },
                   { updatedAt: now() },
                 );

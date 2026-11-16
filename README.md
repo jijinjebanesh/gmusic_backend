@@ -59,11 +59,14 @@ not accepted. Clients connect to `/api/v1/playback/socket` using the account
 session token in the first WebSocket frame (never in the URL). Authenticated
 WebSocket heartbeats carry player snapshots and receive session changes and
 commands in real time. The HTTP polling API remains as a reconnect and
-cross-instance fallback; devices are considered offline after 20 seconds
-without a heartbeat. Commands are acknowledged, have bounded lifetimes, and
-can be cancelled if they time out. A transfer keeps the source authoritative
-until the online target resolves the queue and acknowledges that it has
-prepared the requested track. A failed transfer leaves the source active. The
+cross-instance fallback; devices are considered offline after 12 seconds
+without a heartbeat. If the active device expires while playing, an online
+client can take over through the normal acknowledged handoff; playback resumes
+on the replacement device after it prepares the queue. Commands are
+acknowledged, have bounded lifetimes, and can be cancelled if they time out. A
+transfer keeps the source authoritative until the online target resolves the
+queue and acknowledges that it has prepared the requested track. A failed
+transfer leaves the source active. The
 target resolves track IDs into fresh stream tickets; queue revisions prevent a
 transfer from switching to a stale queue. Queues are capped at 500 tracks, and
 active-player volume is synchronized when the player reports it. Devices can

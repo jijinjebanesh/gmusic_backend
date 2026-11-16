@@ -65,11 +65,14 @@ source of truth. The client uses WebSocket-only transport, so Engine.IO does
 not depend on HTTP long-polling stickiness.
 
 The Socket.IO Redis adapter relays room events between instances when
-`REDIS_URL` is configured and ready. It does not recover missed events; after
-connect or reconnect, clients fetch authoritative session, device and queue
-state from MongoDB. Each playback snapshot includes the server clock reference
-used by clients to render position without relying on synchronized device
-clocks. `/health` reports `playbackRealtime` and `playbackRedis`;
+`REDIS_URL` is configured and its Pub/Sub permissions pass a startup probe.
+The Redis user must be allowed to publish and subscribe to Socket.IO channels.
+If the probe fails, the service keeps local Socket.IO and REST polling rather
+than attaching a failing adapter. The adapter does not recover missed events;
+after connect or reconnect, clients fetch authoritative session, device and
+queue state from MongoDB. Each playback snapshot includes the server clock
+reference used by clients to render position without relying on synchronized
+device clocks. `/health` reports `playbackRealtime` and `playbackRedis`;
 `socketio_local` means realtime broadcasts are instance-local and clients use
 the REST polling recovery path. The HTTP polling and command endpoints remain
 available for recovery and compatibility. Devices are considered offline

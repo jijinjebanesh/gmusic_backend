@@ -12,8 +12,14 @@ class MemoryCollection {
 
   matches(document, filter) {
     return Object.entries(filter).every(([key, expected]) => {
+      if (key === '$or') {
+        return expected.some((condition) => this.matches(document, condition));
+      }
       const actual = document[key];
       if (expected && typeof expected === 'object' && !Array.isArray(expected)) {
+        if ('$exists' in expected) {
+          return (actual !== undefined) === expected.$exists;
+        }
         if ('$gt' in expected) return actual > expected.$gt;
         if ('$gte' in expected) return actual >= expected.$gte;
         if ('$lte' in expected) return actual <= expected.$lte;
@@ -289,6 +295,7 @@ test('playback polling, handoff, commands, and device visibility are account-sco
       method: 'POST',
       body: { deviceId: deviceB, name: 'Android • B', platform: 'android' },
     });
+    assert.equal(targetPoll.body.session.serverTimestamp, testTime.toISOString());
     assert.deepEqual(targetPoll.body.commands.map(({ action, payload }) => [action, payload]), [
       ['seek', { positionMs: 9000 }],
     ]);
@@ -298,10 +305,26 @@ test('playback polling, handoff, commands, and device visibility are account-sco
       body: { deviceId: deviceB, status: 'ok' },
     });
     assert.equal(ack.response.status, 200);
+    const duplicateAck = await request(
+      `/playback/commands/${targetPoll.body.commands[0].id}/ack`,
+      {
+        method: 'POST',
+        body: { deviceId: deviceB, status: 'ok' },
+      },
+    );
+    assert.equal(duplicateAck.response.status, 200);
+    assert.equal(duplicateAck.body.status, 'ok');
     const commandStatus = await request(
       `/playback/commands/${queuedCommand.body.commandId}`,
     );
     assert.equal(commandStatus.body.status, 'ok');
+    const storedCommand = database.collection('playback_commands').documents
+      .find((command) => String(command._id) === queuedCommand.body.commandId);
+    assert.ok(storedCommand.deadlineAt);
+    assert.equal(
+      storedCommand.expiresAt.getTime() - storedCommand.deadlineAt.getTime(),
+      24 * 60 * 60 * 1000,
+    );
 
     const pendingCommand = await request('/playback/commands', {
       method: 'POST',

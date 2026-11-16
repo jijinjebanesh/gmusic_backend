@@ -6,6 +6,7 @@ import { publishPlaybackEvent } from './playback_event_bus.js';
 
 const DEVICE_ONLINE_MS = 12_000;
 const COMMAND_TTL_MS = 60_000;
+const COMMAND_RETENTION_MS = 24 * 60 * 60 * 1000;
 const TRANSFER_TTL_MS = 30_000;
 const MAX_QUEUE_SIZE = 500;
 const MAX_POSITION_MS = 86_400_000;
@@ -41,6 +42,22 @@ function apiError(status, code) {
   error.status = status;
   error.code = code;
   return error;
+}
+
+function commandDeadline(command) {
+  return command.deadlineAt || command.expiresAt;
+}
+
+function commandDeadlineFilter(operator, time) {
+  return {
+    $or: [
+      { deadlineAt: { [operator]: time } },
+      {
+        deadlineAt: { $exists: false },
+        expiresAt: { [operator]: time },
+      },
+    ],
+  };
 }
 
 function requirePersonalAccount(req, res) {
@@ -138,7 +155,7 @@ function sessionFields(snapshot) {
   };
 }
 
-function publicSession(session) {
+function publicSession(session, serverTimestamp = new Date()) {
   if (!session) return null;
   return {
     activeDeviceId: session.activeDeviceId || null,
@@ -156,7 +173,7 @@ function publicSession(session) {
     revision: session.revision || 0,
     transferId: session.lastTransferId || null,
     updatedAt: session.updatedAt || null,
-    serverTimestamp: session.updatedAt || null,
+    serverTimestamp: serverTimestamp.toISOString(),
   };
 }
 
@@ -388,7 +405,12 @@ export async function pollPlayback({
   }
   session = await sessions.findOne({ _id: userId });
   const pending = await commands
-    .find({ userId, deviceId, status: 'pending', expiresAt: { $gt: time } })
+    .find({
+      userId,
+      deviceId,
+      status: 'pending',
+      ...commandDeadlineFilter('$gt', time),
+    })
     .sort({ createdAt: 1 })
     .limit(20)
     .toArray();
@@ -400,7 +422,7 @@ export async function pollPlayback({
     publishPlaybackEvent(userId, { exceptConnectionId });
   }
   return {
-    session: publicSession(session),
+    session: publicSession(session, time),
     devices: activeDevices
       .filter((device) => device.visible !== false || device.deviceId === deviceId)
       .map((device) => publicDevice(device, time, session?.activeDeviceId)),
@@ -489,6 +511,7 @@ export async function createPlaybackCommand({
     throw apiError(409, 'capability_unavailable');
   }
   const createdAt = now();
+  const deadlineAt = new Date(createdAt.getTime() + COMMAND_TTL_MS);
   let inserted;
   try {
     inserted = await commands.insertOne({
@@ -499,7 +522,8 @@ export async function createPlaybackCommand({
       ...(idempotencyKey ? { idempotencyKey } : {}),
       status: 'pending',
       createdAt,
-      expiresAt: new Date(createdAt.getTime() + COMMAND_TTL_MS),
+      deadlineAt,
+      expiresAt: new Date(deadlineAt.getTime() + COMMAND_RETENTION_MS),
     });
   } catch (error) {
     if (error.code !== 11000 || !idempotencyKey) throw error;
@@ -549,7 +573,7 @@ export async function createPlaybackHandoff({
     return {
       transferId: null,
       status: 'completed',
-      session: publicSession(session),
+      session: publicSession(session, time),
     };
   }
   const transferId = new ObjectId();
@@ -578,7 +602,8 @@ export async function createPlaybackHandoff({
     },
     status: 'pending',
     createdAt: time,
-    expiresAt,
+    deadlineAt: expiresAt,
+    expiresAt: new Date(expiresAt.getTime() + COMMAND_RETENTION_MS),
   });
   publishPlaybackEvent(userId, { deviceId });
   return { transferId: String(transferId), status: 'pending' };
@@ -597,22 +622,45 @@ export async function acknowledgePlaybackCommand({
     throw apiError(400, 'invalid_acknowledgment');
   }
   const acknowledgedAt = now();
-  const command = await collection('playback_commands').findOne({
+  const commands = collection('playback_commands');
+  const commandFilter = {
     _id: new ObjectId(commandId),
     userId,
     deviceId,
-    status: 'pending',
-  });
+  };
+  const command = await commands.findOne(commandFilter);
   if (!command) throw apiError(404, 'command_not_found');
-  if (command.expiresAt <= acknowledgedAt) {
-    await collection('playback_commands').updateOne(
-      {
-        _id: command._id,
+  const acknowledgmentError = status === 'failed'
+    ? String(commandError || 'command_failed').slice(0, 120)
+    : null;
+  const isSameAcknowledgment = (saved) =>
+    saved?.status === status &&
+    (saved.error || null) === acknowledgmentError;
+  const completedResult = async (saved) => {
+    let transferStatus = null;
+    if (saved.action === 'handoff') {
+      const transfer = await collection('playback_transfers').findOne({
+        _id: new ObjectId(saved.payload.transferId),
         userId,
-        deviceId,
-        status: 'pending',
-        expiresAt: { $lte: acknowledgedAt },
-      },
+        targetDeviceId: deviceId,
+      });
+      transferStatus = transfer?.status || null;
+    }
+    return {
+      ok: true,
+      commandId: String(saved._id),
+      status: saved.status,
+      error: saved.error || null,
+      transferStatus,
+    };
+  };
+  if (command.status !== 'pending') {
+    if (isSameAcknowledgment(command)) return completedResult(command);
+    throw apiError(409, 'command_not_pending');
+  }
+  if (commandDeadline(command) <= acknowledgedAt) {
+    await commands.updateOne(
+      { ...commandFilter, status: 'pending' },
       {
         $set: {
           status: 'failed',
@@ -623,25 +671,39 @@ export async function acknowledgePlaybackCommand({
     );
     throw apiError(409, 'command_expired');
   }
-  const result = await collection('playback_commands').updateOne(
+  const result = await commands.updateOne(
     {
-      _id: command._id,
-      userId,
-      deviceId,
+      ...commandFilter,
       status: 'pending',
-      expiresAt: { $gt: acknowledgedAt },
+      ...commandDeadlineFilter('$gt', acknowledgedAt),
     },
     {
       $set: {
         status,
         acknowledgedAt,
-        error: status === 'failed'
-          ? String(commandError || 'command_failed').slice(0, 120)
-          : null,
+        error: acknowledgmentError,
       },
     },
   );
-  if (!result.matchedCount) throw apiError(404, 'command_not_found');
+  if (!result.matchedCount) {
+    const saved = await commands.findOne(commandFilter);
+    if (isSameAcknowledgment(saved)) return completedResult(saved);
+    if (!saved) throw apiError(404, 'command_not_found');
+    if (saved.status === 'pending' && commandDeadline(saved) <= acknowledgedAt) {
+      await commands.updateOne(
+        { ...commandFilter, status: 'pending' },
+        {
+          $set: {
+            status: 'failed',
+            error: 'command_timeout',
+            acknowledgedAt,
+          },
+        },
+      );
+      throw apiError(409, 'command_expired');
+    }
+    throw apiError(409, 'command_not_pending');
+  }
 
   let transferStatus = null;
   if (command.action === 'handoff') {
@@ -711,9 +773,7 @@ export async function acknowledgePlaybackCommand({
     ok: true,
     commandId: String(command._id),
     status,
-    error: status === 'failed'
-      ? String(commandError || 'command_failed').slice(0, 120)
-      : null,
+    error: acknowledgmentError,
     transferStatus,
   };
 }
@@ -933,7 +993,7 @@ export function createPlaybackRouter({
         userId: req.user.id,
       });
       if (!command) throw apiError(404, 'command_not_found');
-      if (command.status === 'pending' && command.expiresAt <= now()) {
+      if (command.status === 'pending' && commandDeadline(command) <= now()) {
         await commands.updateOne(
           { _id: command._id, userId: req.user.id, status: 'pending' },
           {

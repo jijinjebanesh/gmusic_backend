@@ -67,14 +67,19 @@ not depend on HTTP long-polling stickiness.
 The Socket.IO Redis adapter relays room events between instances when
 `REDIS_URL` is configured and ready. It does not recover missed events; after
 connect or reconnect, clients fetch authoritative session, device and queue
-state from MongoDB. `/health` reports `playbackRealtime` and `playbackRedis`;
+state from MongoDB. Each playback snapshot includes the server clock reference
+used by clients to render position without relying on synchronized device
+clocks. `/health` reports `playbackRealtime` and `playbackRedis`;
 `socketio_local` means realtime broadcasts are instance-local and clients use
 the REST polling recovery path. The HTTP polling and command endpoints remain
 available for recovery and compatibility. Devices are considered offline
 after 12 seconds without a heartbeat. If the active device expires while
 playing, an online client can take over through the normal acknowledged
-handoff; playback resumes on the replacement device after it prepares the
-queue. Commands have bounded lifetimes and can be cancelled if they time out.
+handoff; playback resumes on the replacement device after it resolves and
+prepares the current track. Queue metadata can finish loading afterward.
+Commands expire for execution after 60 seconds; their status and
+idempotent acknowledgments are retained for 24 hours so retries do not become
+`command_not_found`. Commands can be cancelled if they time out.
 A transfer keeps the source authoritative until the online target resolves
 the queue and acknowledges preparation. A failed transfer leaves the source
 active. Queue revisions reject stale queue operations and prevent transfers

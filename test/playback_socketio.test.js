@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { io as createClient } from 'socket.io-client';
 import { attachPlaybackSocketIO } from '../src/playback_socketio.js';
-import { userRoom } from '../src/playback_event_bus.js';
+import { publishPlaybackEvent } from '../src/playback_event_bus.js';
 
 const DEVICE_A = '0123456789abcdef0123456789abcdef';
 const DEVICE_B = 'abcdef0123456789abcdef0123456789';
@@ -146,10 +146,23 @@ test('Socket.IO authenticates devices and uses server-authorized account rooms',
     const changedPeer = once(clientPeer, 'playback:changed');
     let changedB = false;
     clientOther.once('playback:changed', () => { changedB = true; });
-    socketServer.io.to(userRoom('user-a')).emit('playback:changed', {
-      deviceId: null,
+    publishPlaybackEvent('user-a', {
+      session: {
+        positionMs: 1200,
+        playing: true,
+        playbackEpoch: 3,
+        stateVersion: 8,
+        revision: 8,
+      },
     });
-    await Promise.all([changedA, changedPeer]);
+    const [[stateA], [statePeer]] = await Promise.all([changedA, changedPeer]);
+    for (const state of [stateA, statePeer]) {
+      assert.equal(state.positionMs, 1200);
+      assert.equal(state.isPlaying, true);
+      assert.equal(state.playbackEpoch, 3);
+      assert.equal(state.stateVersion, 8);
+      assert.ok(state.serverTimestamp);
+    }
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(changedB, false);
   } finally {

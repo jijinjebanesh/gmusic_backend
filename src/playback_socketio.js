@@ -47,6 +47,8 @@ const snapshotSchema = z.object({
   repeat: z.enum(['none', 'one', 'all']),
   title: z.string().max(200).optional(),
   artist: z.string().max(200).optional(),
+  playbackEpoch: z.number().int().nonnegative().optional(),
+  advancePlaybackEpoch: z.boolean().optional(),
 }).strict();
 
 const registerSchema = z.object({
@@ -240,6 +242,7 @@ export function attachPlaybackSocketIO(server, {
         body: { ...identity, snapshot, claim },
         collection,
         now,
+        exceptConnectionId: socket.id,
       });
       return result;
     };

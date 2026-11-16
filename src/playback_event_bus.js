@@ -143,14 +143,34 @@ export function attachPlaybackSocketServer(socketServer) {
   io = socketServer;
 }
 
-export function publishPlaybackEvent(userId, { deviceId = null } = {}) {
+export function publishPlaybackEvent(
+  userId,
+  {
+    deviceId = null,
+    session = null,
+    serverTimestamp = new Date().toISOString(),
+    exceptConnectionId = null,
+  } = {},
+) {
   if (!io || !userId) return;
   const room = deviceId
     ? deviceRoom(userId, deviceId)
     : userRoom(userId);
-  io.to(room).emit('playback:changed', {
+  const operator = exceptConnectionId
+    ? io.to(room).except(exceptConnectionId)
+    : io.to(room);
+  operator.emit('playback:changed', {
     deviceId,
-    serverTimestamp: new Date().toISOString(),
+    serverTimestamp,
+    ...(session
+      ? {
+          session,
+          positionMs: session.positionMs,
+          isPlaying: session.playing === true,
+          playbackEpoch: session.playbackEpoch || 0,
+          stateVersion: session.stateVersion || session.revision || 0,
+        }
+      : {}),
   });
 }
 

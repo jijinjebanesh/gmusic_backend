@@ -154,6 +154,41 @@ test('playback polling, handoff, commands, and device visibility are account-sco
     });
     assert.equal(firstPoll.response.status, 200);
     assert.equal(firstPoll.body.session.activeDeviceId, deviceA);
+    assert.equal(firstPoll.body.session.playbackEpoch, 1);
+    assert.equal(firstPoll.body.session.stateVersion, 1);
+
+    const discontinuityPoll = await request('/playback/poll', {
+      method: 'POST',
+      body: {
+        deviceId: deviceA,
+        name: 'Android • A',
+        platform: 'android',
+        snapshot: {
+          ...snapshot,
+          playbackEpoch: firstPoll.body.session.playbackEpoch,
+          advancePlaybackEpoch: true,
+        },
+      },
+    });
+    assert.equal(discontinuityPoll.body.session.playbackEpoch, 2);
+    assert.equal(discontinuityPoll.body.session.stateVersion, 2);
+
+    const staleEpochPoll = await request('/playback/poll', {
+      method: 'POST',
+      body: {
+        deviceId: deviceA,
+        name: 'Android • A',
+        platform: 'android',
+        snapshot: {
+          ...snapshot,
+          trackIds: ['stale-track'],
+          playbackEpoch: firstPoll.body.session.playbackEpoch,
+        },
+      },
+    });
+    assert.deepEqual(staleEpochPoll.body.session.trackIds, snapshot.trackIds);
+    assert.equal(staleEpochPoll.body.session.playbackEpoch, 2);
+    assert.equal(staleEpochPoll.body.session.stateVersion, 2);
 
     const secondPoll = await request('/playback/poll', {
       method: 'POST',
@@ -164,6 +199,19 @@ test('playback polling, handoff, commands, and device visibility are account-sco
       },
     });
     assert.equal(secondPoll.response.status, 200);
+
+    const competingClaim = await request('/playback/poll', {
+      method: 'POST',
+      body: {
+        deviceId: deviceB,
+        name: 'Android • B',
+        platform: 'android',
+        claim: true,
+        snapshot: { ...snapshot, playbackEpoch: 0 },
+      },
+    });
+    assert.equal(competingClaim.body.session.activeDeviceId, deviceA);
+    assert.equal(competingClaim.body.session.playbackEpoch, 2);
 
     const failedTransfer = await request('/playback/handoff', {
       method: 'POST',
@@ -222,6 +270,8 @@ test('playback polling, handoff, commands, and device visibility are account-sco
     });
     assert.equal(changedPoll.response.status, 200);
     assert.equal(changedPoll.body.session.index, 1);
+    assert.equal(changedPoll.body.session.playbackEpoch, 3);
+    assert.ok(changedPoll.body.session.stateVersion > 2);
     const staleHandoffPoll = await request('/playback/poll', {
       method: 'POST',
       body: { deviceId: deviceB, name: 'Android • B', platform: 'android' },
@@ -271,11 +321,46 @@ test('playback polling, handoff, commands, and device visibility are account-sco
       body: { deviceId: deviceB, status: 'ok' },
     });
     assert.equal(handoffAck.response.status, 200);
-    assert.equal(handoffAck.body.transferStatus, 'completed');
+    assert.equal(handoffAck.body.transferStatus, 'pending');
+    assert.equal(
+      (await request('/playback/state')).body.session.activeDeviceId,
+      deviceA,
+    );
+
+    const sourcePausePoll = await request('/playback/poll', {
+      method: 'POST',
+      body: {
+        deviceId: deviceA,
+        name: 'Android • A',
+        platform: 'android',
+        snapshot: {
+          ...changedSnapshot,
+          positionMs: 45_000,
+          playing: false,
+        },
+      },
+    });
+    const sourcePauseCommand = sourcePausePoll.body.commands.find(
+      ({ action, payload }) =>
+        action === 'pause' &&
+        payload.handoffTransferId === retry.body.transferId,
+    );
+    assert.ok(sourcePauseCommand);
+    assert.equal(sourcePausePoll.body.session.positionMs, 45_000);
+    const sourcePauseAck = await request(
+      `/playback/commands/${sourcePauseCommand.id}/ack`,
+      {
+        method: 'POST',
+        body: { deviceId: deviceA, status: 'ok' },
+      },
+    );
+    assert.equal(sourcePauseAck.body.transferStatus, 'completed');
     const transfer = await request(`/playback/transfers/${retry.body.transferId}`);
     assert.equal(transfer.body.status, 'completed');
     const handedOffState = await request('/playback/state');
     assert.equal(handedOffState.body.session.activeDeviceId, deviceB);
+    assert.equal(handedOffState.body.session.positionMs, 45_000);
+    assert.equal(handedOffState.body.session.playing, true);
     assert.deepEqual(handedOffState.body.session.trackIds, snapshot.trackIds);
 
     const invalidQueueCommand = await request('/playback/commands', {
@@ -295,6 +380,8 @@ test('playback polling, handoff, commands, and device visibility are account-sco
       method: 'POST',
       body: { deviceId: deviceB, name: 'Android • B', platform: 'android' },
     });
+    assert.equal(targetPoll.body.serverRequestTimestamp, testTime.toISOString());
+    assert.equal(targetPoll.body.serverTimestamp, testTime.toISOString());
     assert.equal(targetPoll.body.session.serverTimestamp, testTime.toISOString());
     assert.deepEqual(targetPoll.body.commands.map(({ action, payload }) => [action, payload]), [
       ['seek', { positionMs: 9000 }],

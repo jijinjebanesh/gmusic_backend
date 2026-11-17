@@ -22,6 +22,7 @@ const MIN_GROUP_BUFFER_MS = 2_000;
 const GROUP_PAUSE_LEAD_MS = 1_500;
 const ROOM_TTL_MS = 24 * 60 * 60_000;
 const MAX_POSITION_MS = 86_400_000;
+const MAX_POSITION_SAMPLE_AGE_MS = 15_000;
 
 function apiError(status, code) {
   return Object.assign(new Error(code), { status, code });
@@ -471,6 +472,7 @@ export function createGroupListeningRouter({
         bufferedMs,
         clockOffsetMs,
         latencyCompensationMs,
+        positionTimestampMs,
       } = req.body || {};
       if (ready !== undefined && typeof ready !== 'boolean') {
         throw apiError(400, 'invalid_group_heartbeat');
@@ -499,6 +501,12 @@ export function createGroupListeningRouter({
            Math.abs(latencyCompensationMs) > 5_000)) {
         throw apiError(400, 'invalid_group_heartbeat');
       }
+      if (positionTimestampMs !== undefined &&
+          (!Number.isSafeInteger(positionTimestampMs) ||
+           Math.abs(positionTimestampMs - time.getTime()) >
+             MAX_POSITION_SAMPLE_AGE_MS)) {
+        throw apiError(400, 'invalid_group_heartbeat');
+      }
       if (ready && trackId !== room.trackIds[room.index]) {
         throw apiError(409, 'group_track_changed');
       }
@@ -506,6 +514,9 @@ export function createGroupListeningRouter({
         (bufferedMs >= MIN_GROUP_BUFFER_MS ||
           (durationMs > 0 && positionMs + bufferedMs >= durationMs));
       const memberReady = ready === true && hasUsableBuffer;
+      const positionSampleTime = positionTimestampMs === undefined
+        ? time
+        : new Date(positionTimestampMs);
       const updated = await updateRoom(groups(), room._id, (current) => {
         const members = current.members.map((item) =>
           item.memberId === member.memberId
@@ -525,7 +536,9 @@ export function createGroupListeningRouter({
                 ...(positionMs !== undefined
                   ? {
                       reportedPositionMs: positionMs,
-                      driftMs: Math.round(positionMs - roomPosition(current, time)),
+                      driftMs: Math.round(
+                        positionMs - roomPosition(current, positionSampleTime),
+                      ),
                     }
                   : {}),
               }

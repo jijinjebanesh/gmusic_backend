@@ -268,6 +268,19 @@ test('group sessions authorize each account and schedule after every online play
     assert.equal(created.response.status, 201);
     const sessionId = created.body.room.sessionId;
     const invitationCode = created.body.room.invitationCode;
+
+    const stalePositionSample = await request(
+      `/group-listening/${sessionId}/heartbeat`,
+      {
+        method: 'POST',
+        body: {
+          deviceId: hostDeviceId,
+          positionTimestampMs: time.getTime() - 60_000,
+        },
+      },
+    );
+    assert.equal(stalePositionSample.response.status, 400);
+    assert.equal(stalePositionSample.body.error, 'invalid_group_heartbeat');
     assert.equal(created.body.room.status, 'paused');
     const recovered = await request('/group-listening', {
       method: 'POST',
@@ -482,6 +495,13 @@ test('group sessions authorize each account and schedule after every online play
     assert.equal(streamRecovered.body.room.status, 'scheduled');
 
     time = new Date(time.getTime() + 13_000);
+    const roomBeforeHeartbeat = await request(
+      `/group-listening/${sessionId}?deviceId=${guestDeviceId}`,
+      { user: 'guest' },
+    );
+    const positionTimestampMs = time.getTime() - 1_000;
+    const positionMs =
+      roomBeforeHeartbeat.body.room.positionMs - 1_000 + 3_000;
     const guestHeartbeat = await request(
       `/group-listening/${sessionId}/heartbeat`,
       {
@@ -491,7 +511,8 @@ test('group sessions authorize each account and schedule after every online play
           deviceId: guestDeviceId,
           ready: true,
           trackId: 'track-a',
-          positionMs: 19_000,
+          positionMs,
+          positionTimestampMs,
           durationMs: 240_000,
           bufferedMs: 2_000,
         },

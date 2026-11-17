@@ -54,7 +54,9 @@ function parseSessionId(value) {
 }
 
 function roomPosition(room, time) {
-  if (!room.playing) return room.positionMs || 0;
+  if (!room.playing || room.status === 'preparing') {
+    return room.positionMs || 0;
+  }
   const anchor = room.startAtServerTime
     ? new Date(room.startAtServerTime).getTime()
     : new Date(room.updatedAt || time).getTime();
@@ -576,11 +578,15 @@ export function createGroupListeningRouter({
           }
         }
         if (next.status === 'scheduled' && !readyMembers(next, time)) {
-          next = {
-            ...next,
-            status: 'preparing',
-            startAtServerTime: null,
-          };
+          if (new Date(next.startAtServerTime).getTime() > time.getTime()) {
+            next = {
+              ...next,
+              status: 'preparing',
+              startAtServerTime: null,
+            };
+          } else {
+            next = { ...next, status: 'playing' };
+          }
         }
         return scheduleIfReady(next, time);
       }, time);
@@ -671,10 +677,13 @@ export function createGroupListeningRouter({
             return {
               ...current,
               positionMs,
-              startAtServerTime: current.playing
-                ? new Date(time.getTime() + 1_500).toISOString()
-                : null,
-              status: current.playing ? 'scheduled' : 'paused',
+              startAtServerTime: null,
+              status: current.playing ? 'preparing' : 'paused',
+              members: current.members.map((item) => ({
+                ...item,
+                ready: false,
+                readyAt: null,
+              })),
             };
           }
           case 'next':

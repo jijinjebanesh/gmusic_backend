@@ -415,6 +415,15 @@ test('group sessions authorize each account and schedule after every online play
     );
     assert.equal(prematureStart.body.room.status, 'preparing');
     assert.equal(prematureStart.body.room.startAtServerTime, null);
+    const preparingPositionMs = prematureStart.body.room.positionMs;
+    time = new Date(time.getTime() + 2_000);
+    const stillPreparing = await request(
+      `/group-listening/${sessionId}?deviceId=${guestDeviceId}`,
+      { user: 'guest' },
+    );
+    assert.equal(stillPreparing.body.room.status, 'preparing');
+    assert.equal(stillPreparing.body.room.positionMs, preparingPositionMs);
+    time = new Date(time.getTime() - 2_000);
 
     const bufferAvailable = await request(
       `/group-listening/${sessionId}/heartbeat`,
@@ -466,6 +475,59 @@ test('group sessions authorize each account and schedule after every online play
       3_000,
     );
 
+    const seek = await request(
+      `/group-listening/${sessionId}/control`,
+      {
+        method: 'POST',
+        body: {
+          deviceId: hostDeviceId,
+          action: 'seek',
+          positionMs: 90_000,
+        },
+      },
+    );
+    assert.equal(seek.body.room.status, 'preparing');
+    assert.equal(seek.body.room.startAtServerTime, null);
+    assert.equal(seek.body.room.positionMs, 90_000);
+    assert.ok(seek.body.room.members.every((member) => !member.ready));
+    time = new Date(time.getTime() + 2_000);
+    const stillPreparingAfterSeek = await request(
+      `/group-listening/${sessionId}?deviceId=${guestDeviceId}`,
+      { user: 'guest' },
+    );
+    assert.equal(stillPreparingAfterSeek.body.room.positionMs, 90_000);
+    time = new Date(time.getTime() - 2_000);
+    for (const [user, deviceId] of [
+      ['host', hostDeviceId],
+      ['guest', guestDeviceId],
+    ]) {
+      const seekReady = await request(
+        `/group-listening/${sessionId}/heartbeat`,
+        {
+          user,
+          method: 'POST',
+          body: {
+            deviceId,
+            ready: true,
+            trackId: 'track-a',
+            positionMs: 90_000,
+            durationMs: 240_000,
+            bufferedMs: 2_000,
+          },
+        },
+      );
+      assert.equal(seekReady.response.status, 200);
+    }
+    assert.equal(
+      (
+        await request(
+          `/group-listening/${sessionId}?deviceId=${guestDeviceId}`,
+          { user: 'guest' },
+        )
+      ).body.room.status,
+      'scheduled',
+    );
+
     const streamLost = await request(
       `/group-listening/${sessionId}/heartbeat`,
       {
@@ -494,7 +556,19 @@ test('group sessions authorize each account and schedule after every online play
     assert.equal(streamRecovered.response.status, 200);
     assert.equal(streamRecovered.body.room.status, 'scheduled');
 
-    time = new Date(time.getTime() + 13_000);
+    time = new Date(time.getTime() + 4_000);
+    const lateStreamLoss = await request(
+      `/group-listening/${sessionId}/heartbeat`,
+      {
+        user: 'guest',
+        method: 'POST',
+        body: { deviceId: guestDeviceId, ready: false },
+      },
+    );
+    assert.equal(lateStreamLoss.response.status, 200);
+    assert.equal(lateStreamLoss.body.room.status, 'playing');
+
+    time = new Date(time.getTime() + 9_000);
     const roomBeforeHeartbeat = await request(
       `/group-listening/${sessionId}?deviceId=${guestDeviceId}`,
       { user: 'guest' },

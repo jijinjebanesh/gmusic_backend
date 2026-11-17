@@ -180,13 +180,16 @@ test('group sessions authorize each account and schedule after every online play
   let time = new Date('2026-11-17T00:00:00.000Z');
   const hostDeviceId = '0123456789abcdef0123456789abcdef';
   const guestDeviceId = 'abcdef0123456789abcdef0123456789';
+  const endHostDeviceId = 'fedcba9876543210fedcba9876543210';
   const allowedTracks = new Map([
     ['host', new Set(['track-a', 'track-b'])],
     ['guest', new Set(['track-a'])],
+    ['end-host', new Set(['track-a'])],
   ]);
   for (const [userId, deviceId] of [
     ['host', hostDeviceId],
     ['guest', guestDeviceId],
+    ['end-host', endHostDeviceId],
   ]) {
     await database.collection('playback_devices').insertOne({
       userId,
@@ -352,6 +355,39 @@ test('group sessions authorize each account and schedule after every online play
     ).memberId;
     allowedTracks.get('guest').delete('track-b');
     allowedTracks.get('host').add('track-c');
+
+    for (const action of ['play', 'queueRemove', 'end']) {
+      const forbidden = await request(
+        `/group-listening/${sessionId}/control`,
+        {
+          user: 'guest',
+          method: 'POST',
+          body: {
+            deviceId: guestDeviceId,
+            action,
+            index: 0,
+          },
+        },
+      );
+      assert.equal(forbidden.response.status, 403);
+      assert.equal(forbidden.body.error, 'group_host_required');
+    }
+
+    const participantQueueAdd = await request(
+      `/group-listening/${sessionId}/control`,
+      {
+        user: 'guest',
+        method: 'POST',
+        body: {
+          deviceId: guestDeviceId,
+          action: 'queueAdd',
+          trackId: 'track-a',
+          placement: 'last',
+        },
+      },
+    );
+    assert.equal(participantQueueAdd.response.status, 200);
+    assert.equal(participantQueueAdd.body.room.trackIds.at(-1), 'track-a');
 
     const inaccessibleQueueAdd = await request(
       `/group-listening/${sessionId}/control`,
@@ -635,6 +671,63 @@ test('group sessions authorize each account and schedule after every online play
       })).groupSessionId,
       undefined,
     );
+
+    await database.collection('playback_devices').updateOne(
+      { userId: 'end-host', deviceId: endHostDeviceId },
+      { $set: { lastSeenAt: time } },
+    );
+    await database.collection('playback_devices').updateOne(
+      { userId: 'guest', deviceId: guestDeviceId },
+      { $set: { lastSeenAt: time } },
+    );
+    const endSessionRoom = await request('/group-listening', {
+      user: 'end-host',
+      method: 'POST',
+      body: {
+        title: 'End Session Test',
+        deviceId: endHostDeviceId,
+        trackIds: ['track-a'],
+        index: 0,
+        positionMs: 0,
+        durationMs: 240_000,
+      },
+    });
+    assert.equal(endSessionRoom.response.status, 201);
+    const newRoomId = endSessionRoom.body.room.sessionId;
+    const newGuestJoin = await request('/group-listening/join', {
+      user: 'guest',
+      method: 'POST',
+      body: {
+        invitationCode: endSessionRoom.body.room.invitationCode,
+        deviceId: guestDeviceId,
+      },
+    });
+    assert.equal(newGuestJoin.response.status, 201);
+    const newGuestMemberId = newGuestJoin.body.room.members.find(
+      (member) => member.name === 'guest',
+    ).memberId;
+    const hostLeave = await request(
+      `/group-listening/${newRoomId}/leave`,
+      {
+        user: 'end-host',
+        method: 'POST',
+        body: { deviceId: endHostDeviceId },
+      },
+    );
+    assert.equal(hostLeave.response.status, 200);
+    assert.notEqual(hostLeave.body.room.status, 'ended');
+    assert.equal(hostLeave.body.room.hostMemberId, newGuestMemberId);
+
+    const ended = await request(
+      `/group-listening/${newRoomId}/control`,
+      {
+        user: 'guest',
+        method: 'POST',
+        body: { deviceId: guestDeviceId, action: 'end' },
+      },
+    );
+    assert.equal(ended.response.status, 200);
+    assert.equal(ended.body.room.status, 'ended');
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

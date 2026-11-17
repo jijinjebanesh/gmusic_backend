@@ -23,6 +23,19 @@ const GROUP_PAUSE_LEAD_MS = 1_500;
 const ROOM_TTL_MS = 24 * 60 * 60_000;
 const MAX_POSITION_MS = 86_400_000;
 const MAX_POSITION_SAMPLE_AGE_MS = 15_000;
+const HOST_ONLY_CONTROL_ACTIONS = new Set([
+  'play',
+  'pause',
+  'seek',
+  'next',
+  'previous',
+  'queuePlay',
+  'queueReplace',
+  'queueRemove',
+  'queueReorder',
+  'queueClear',
+  'end',
+]);
 
 function apiError(status, code) {
   return Object.assign(new Error(code), { status, code });
@@ -615,6 +628,10 @@ export function createGroupListeningRouter({
       const { room, member } = await requireMember(
         groups(), req.params.sessionId, req.user.id, deviceId, time,
       );
+      if (HOST_ONLY_CONTROL_ACTIONS.has(action) &&
+          member.memberId !== room.hostMemberId) {
+        throw apiError(403, 'group_host_required');
+      }
       let addedTrackId = null;
       let replacementTrackIds = null;
       if (action === 'queueAdd') {
@@ -642,6 +659,10 @@ export function createGroupListeningRouter({
         );
       }
       const updated = await updateRoom(groups(), room._id, (current) => {
+        if (HOST_ONLY_CONTROL_ACTIONS.has(action) &&
+            member.memberId !== current.hostMemberId) {
+          throw apiError(403, 'group_host_required');
+        }
         const currentPosition = roomPosition(current, time);
         switch (action) {
           case 'play':

@@ -4,6 +4,7 @@ import express from 'express';
 import { createServer } from 'node:http';
 import { ObjectId } from 'mongodb';
 import { createGroupListeningRouter } from '../src/group_listening.js';
+import { claimPlaybackDeviceForGroup } from '../src/playback.js';
 
 class MemoryCollection {
   constructor() {
@@ -23,6 +24,7 @@ class MemoryCollection {
         if ('$exists' in expected) return (actual !== undefined) === expected.$exists;
         if ('$gt' in expected) return actual > expected.$gt;
         if ('$gte' in expected) return actual >= expected.$gte;
+        if ('$lte' in expected) return actual <= expected.$lte;
         if ('$ne' in expected) return actual !== expected.$ne;
       }
       return actual === expected;
@@ -87,6 +89,67 @@ class MemoryDatabase {
     return this.collections.get(name);
   }
 }
+
+test('group device claims clear legacy references to ended rooms but preserve active ownership', async () => {
+  const database = new MemoryDatabase();
+  const time = new Date('2026-11-17T00:00:00.000Z');
+  const deviceId = '0123456789abcdef0123456789abcdef';
+  const oldRoomId = new ObjectId();
+  const activeRoomId = new ObjectId();
+  await database.collection('playback_devices').insertOne({
+    userId: 'host',
+    deviceId,
+    lastSeenAt: time,
+    groupSessionId: String(oldRoomId),
+  });
+  await database.collection('group_listening_sessions').insertOne({
+    _id: oldRoomId,
+    status: 'ended',
+    expiresAt: new Date(time.getTime() + 60_000),
+  });
+
+  await claimPlaybackDeviceForGroup({
+    userId: 'host',
+    deviceId,
+    groupSessionId: String(new ObjectId()),
+    groupSessionExpiresAt: new Date(time.getTime() + 86_400_000),
+    collection: (name) => database.collection(name),
+    now: () => time,
+  });
+  const claimed = await database.collection('playback_devices').findOne({
+    userId: 'host',
+    deviceId,
+  });
+  assert.notEqual(claimed.groupSessionId, String(oldRoomId));
+  assert.ok(claimed.groupSessionExpiresAt);
+
+  await database.collection('group_listening_sessions').insertOne({
+    _id: activeRoomId,
+    status: 'paused',
+    expiresAt: new Date(time.getTime() + 60_000),
+    members: [{ userId: 'host', deviceId }],
+  });
+  await database.collection('playback_devices').updateOne(
+    { userId: 'host', deviceId },
+    { $set: { groupSessionId: String(activeRoomId) }, $unset: { groupSessionExpiresAt: '' } },
+  );
+  await assert.rejects(
+    claimPlaybackDeviceForGroup({
+      userId: 'host',
+      deviceId,
+      groupSessionId: String(new ObjectId()),
+      groupSessionExpiresAt: new Date(time.getTime() + 86_400_000),
+      collection: (name) => database.collection(name),
+      now: () => time,
+    }),
+    (error) => error.code === 'device_in_group_session',
+  );
+  const stillClaimed = await database.collection('playback_devices').findOne({
+    userId: 'host',
+    deviceId,
+  });
+  assert.equal(stillClaimed.groupSessionId, String(activeRoomId));
+});
 
 test('group sessions authorize each account and schedule after every online player is ready', async () => {
   const database = new MemoryDatabase();

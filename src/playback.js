@@ -520,7 +520,31 @@ export async function claimPlaybackDeviceForGroup({
   now = () => new Date(),
 }) {
   const time = now();
-  const result = await collection('playback_devices').updateOne(
+  const devices = collection('playback_devices');
+  const existingDevice = await devices.findOne({ userId, deviceId });
+  if (
+    existingDevice?.groupSessionId &&
+    existingDevice.groupSessionId !== groupSessionId
+  ) {
+    let activeGroup = null;
+    if (ObjectId.isValid(existingDevice.groupSessionId)) {
+      activeGroup = await collection('group_listening_sessions').findOne({
+        _id: new ObjectId(existingDevice.groupSessionId),
+        status: { $ne: 'ended' },
+        expiresAt: { $gt: time },
+      });
+    }
+    if (activeGroup) throw apiError(409, 'device_in_group_session');
+    await devices.updateOne(
+      {
+        userId,
+        deviceId,
+        groupSessionId: existingDevice.groupSessionId,
+      },
+      { $unset: { groupSessionId: '', groupSessionExpiresAt: '' } },
+    );
+  }
+  const result = await devices.updateOne(
     {
       userId,
       deviceId,

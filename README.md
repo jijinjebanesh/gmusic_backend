@@ -101,6 +101,10 @@ state. The backend schedules a common future start after active members report
 that they are ready; clients estimate server-clock offset and correct playback
 drift locally. This is best-effort synchronization, not sample-accurate or
 acoustic-latency synchronization over arbitrary devices and networks.
+Clients report readiness only after their stream is loaded and has at least two
+seconds of buffered audio (or the full remainder of a shorter track).
+Readiness reports expire after six seconds, and a scheduled start is cancelled
+if any online participant reports that its stream is no longer ready.
 If a room-creation response is lost, retrying creation on the same device
 resumes its existing active room instead of creating a duplicate.
 The group Socket.IO watch response reports whether events are shared across

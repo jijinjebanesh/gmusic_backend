@@ -17,6 +17,8 @@ import {
 const MAX_MEMBERS = 20;
 const MAX_QUEUE_SIZE = 500;
 const MEMBER_ONLINE_MS = 12_000;
+const MEMBER_READY_MS = 6_000;
+const MIN_GROUP_BUFFER_MS = 2_000;
 const ROOM_TTL_MS = 24 * 60 * 60_000;
 const MAX_POSITION_MS = 86_400_000;
 
@@ -66,6 +68,13 @@ function isOnline(member, time) {
   return time.getTime() - new Date(member.lastSeenAt).getTime() <= MEMBER_ONLINE_MS;
 }
 
+function isReady(member, time) {
+  if (member.ready !== true || !member.readyAt) return false;
+  const readyAt = new Date(member.readyAt).getTime();
+  const age = time.getTime() - readyAt;
+  return age >= 0 && age <= MEMBER_READY_MS;
+}
+
 function publicRoom(room, time) {
   const positionMs = roomPosition(room, time);
   const status = room.status === 'scheduled' &&
@@ -93,7 +102,7 @@ function publicRoom(room, time) {
       platform: member.platform,
       isHost: member.memberId === room.hostMemberId,
       online: isOnline(member, time),
-      ready: member.ready === true,
+      ready: isReady(member, time),
       driftMs: Number.isFinite(member.driftMs) ? member.driftMs : null,
       latencyCompensationMs: member.latencyCompensationMs || 0,
       joinedAt: member.joinedAt,
@@ -207,7 +216,7 @@ async function verifyRoomTrackAccess(req, room, ids, getAccessibleTracks) {
 
 function readyMembers(room, time) {
   const active = (room.members || []).filter((member) => isOnline(member, time));
-  return active.length > 0 && active.every((member) => member.ready === true);
+  return active.length > 0 && active.every((member) => isReady(member, time));
 }
 
 function scheduleIfReady(room, time) {
@@ -238,6 +247,7 @@ function createMember(req, device, time) {
     joinedAt: time,
     lastSeenAt: time,
     ready: false,
+    readyAt: null,
     needsCatchUp: false,
     driftMs: null,
     clockOffsetMs: 0,
@@ -457,6 +467,7 @@ export function createGroupListeningRouter({
         trackId,
         positionMs,
         durationMs,
+        bufferedMs,
         clockOffsetMs,
         latencyCompensationMs,
       } = req.body || {};
@@ -473,6 +484,11 @@ export function createGroupListeningRouter({
            durationMs > MAX_POSITION_MS)) {
         throw apiError(400, 'invalid_group_heartbeat');
       }
+      if (bufferedMs !== undefined &&
+          (!Number.isSafeInteger(bufferedMs) || bufferedMs < 0 ||
+           bufferedMs > MAX_POSITION_MS)) {
+        throw apiError(400, 'invalid_group_heartbeat');
+      }
       if (clockOffsetMs !== undefined &&
           (!Number.isSafeInteger(clockOffsetMs) || Math.abs(clockOffsetMs) > 120_000)) {
         throw apiError(400, 'invalid_group_heartbeat');
@@ -485,14 +501,20 @@ export function createGroupListeningRouter({
       if (ready && trackId !== room.trackIds[room.index]) {
         throw apiError(409, 'group_track_changed');
       }
+      const hasUsableBuffer = bufferedMs !== undefined &&
+        (bufferedMs >= MIN_GROUP_BUFFER_MS ||
+          (durationMs > 0 && positionMs + bufferedMs >= durationMs));
+      const memberReady = ready === true && hasUsableBuffer;
       const updated = await updateRoom(groups(), room._id, (current) => {
         const members = current.members.map((item) =>
           item.memberId === member.memberId
             ? {
                 ...item,
                 lastSeenAt: time,
-                ...(ready !== undefined ? { ready } : {}),
-                ...(ready === true && item.needsCatchUp
+                ...(ready !== undefined
+                  ? { ready: memberReady, readyAt: memberReady ? time : null }
+                  : {}),
+                ...(memberReady && item.needsCatchUp
                   ? { needsCatchUp: false }
                   : {}),
                 ...(clockOffsetMs !== undefined ? { clockOffsetMs } : {}),
@@ -525,6 +547,7 @@ export function createGroupListeningRouter({
               members: next.members.map((item) => ({
                 ...item,
                 ready: false,
+                readyAt: null,
               })),
               queueRevision: (next.queueRevision || 0) + 1,
             };
@@ -538,6 +561,13 @@ export function createGroupListeningRouter({
             };
           }
         }
+        if (next.status === 'scheduled' && !readyMembers(next, time)) {
+          next = {
+            ...next,
+            status: 'preparing',
+            startAtServerTime: null,
+          };
+        }
         return scheduleIfReady(next, time);
       }, time);
       if (updated.status !== room.status || updated.index !== room.index ||
@@ -549,7 +579,7 @@ export function createGroupListeningRouter({
         driftMs: updated.members.find(
           (item) => item.memberId === member.memberId,
         )?.driftMs ?? null,
-        catchUpAtServerTime: member.needsCatchUp && ready === true
+        catchUpAtServerTime: member.needsCatchUp && memberReady
         ? new Date(time.getTime() + 2_000).toISOString()
         : null,
       });
@@ -649,6 +679,7 @@ export function createGroupListeningRouter({
               members: current.members.map((item) => ({
                 ...item,
                 ready: false,
+                readyAt: null,
               })),
               queueRevision: (current.queueRevision || 0) + 1,
             }, time);
@@ -680,6 +711,7 @@ export function createGroupListeningRouter({
               members: current.members.map((item) => ({
                 ...item,
                 ready: false,
+                readyAt: null,
               })),
               queueRevision: (current.queueRevision || 0) + 1,
             };
@@ -732,6 +764,7 @@ export function createGroupListeningRouter({
                 members: current.members.map((item) => ({
                   ...item,
                   ready: false,
+                  readyAt: null,
                 })),
               } : {}),
               queueRevision: (current.queueRevision || 0) + 1,

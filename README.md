@@ -101,6 +101,8 @@ state. The backend schedules a common future start after active members report
 that they are ready; clients estimate server-clock offset and correct playback
 drift locally. This is best-effort synchronization, not sample-accurate or
 acoustic-latency synchronization over arbitrary devices and networks.
+If a room-creation response is lost, retrying creation on the same device
+resumes its existing active room instead of creating a duplicate.
 
 A device claimed by a group cannot be targeted by Connected Playback commands,
 handoffs, or device disconnect/forget operations. Its personal account session

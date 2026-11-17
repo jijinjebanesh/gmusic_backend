@@ -534,7 +534,10 @@ export async function claimPlaybackDeviceForGroup({
         expiresAt: { $gt: time },
       });
     }
-    if (activeGroup) throw apiError(409, 'device_in_group_session');
+    const isActiveMember = activeGroup?.members?.some(
+      (member) => member.userId === userId && member.deviceId === deviceId,
+    );
+    if (isActiveMember) throw apiError(409, 'device_in_group_session');
     await devices.updateOne(
       {
         userId,

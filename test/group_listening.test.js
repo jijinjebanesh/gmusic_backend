@@ -17,6 +17,10 @@ class MemoryCollection {
         return expected.some((condition) => this.matches(document, condition));
       }
       const actual = key.split('.').reduce((value, part) => value?.[part], document);
+      if (expected?.$elemMatch) {
+        return Array.isArray(actual) &&
+          actual.some((item) => this.matches(item, expected.$elemMatch));
+      }
       if (expected instanceof ObjectId) {
         return actual instanceof ObjectId && actual.equals(expected);
       }
@@ -131,7 +135,10 @@ test('group device claims clear legacy references to ended rooms but preserve ac
   });
   await database.collection('playback_devices').updateOne(
     { userId: 'host', deviceId },
-    { $set: { groupSessionId: String(activeRoomId) }, $unset: { groupSessionExpiresAt: '' } },
+    {
+      $set: { groupSessionId: String(activeRoomId) },
+      $unset: { groupSessionExpiresAt: '' },
+    },
   );
   await assert.rejects(
     claimPlaybackDeviceForGroup({
@@ -144,11 +151,28 @@ test('group device claims clear legacy references to ended rooms but preserve ac
     }),
     (error) => error.code === 'device_in_group_session',
   );
+
+  await database.collection('group_listening_sessions').updateOne(
+    { _id: activeRoomId },
+    { $set: { members: [] } },
+  );
+  await database.collection('playback_devices').updateOne(
+    { userId: 'host', deviceId },
+    { $set: { groupSessionId: String(activeRoomId) }, $unset: { groupSessionExpiresAt: '' } },
+  );
+  await claimPlaybackDeviceForGroup({
+    userId: 'host',
+    deviceId,
+    groupSessionId: String(new ObjectId()),
+    groupSessionExpiresAt: new Date(time.getTime() + 86_400_000),
+    collection: (name) => database.collection(name),
+    now: () => time,
+  });
   const stillClaimed = await database.collection('playback_devices').findOne({
     userId: 'host',
     deviceId,
   });
-  assert.equal(stillClaimed.groupSessionId, String(activeRoomId));
+  assert.notEqual(stillClaimed.groupSessionId, String(activeRoomId));
 });
 
 test('group sessions authorize each account and schedule after every online player is ready', async () => {
@@ -245,6 +269,24 @@ test('group sessions authorize each account and schedule after every online play
     const sessionId = created.body.room.sessionId;
     const invitationCode = created.body.room.invitationCode;
     assert.equal(created.body.room.status, 'paused');
+    const recovered = await request('/group-listening', {
+      method: 'POST',
+      body: {
+        title: 'Retry after lost response',
+        deviceId: hostDeviceId,
+        trackIds: ['track-a', 'track-b'],
+        index: 0,
+        positionMs: 0,
+        durationMs: 240_000,
+      },
+    });
+    assert.equal(recovered.response.status, 200);
+    assert.equal(recovered.body.recovered, true);
+    assert.equal(recovered.body.room.sessionId, sessionId);
+    assert.equal(
+      database.collection('group_listening_sessions').documents.length,
+      1,
+    );
     assert.equal(
       (await database.collection('playback_devices').findOne({
         userId: 'host',

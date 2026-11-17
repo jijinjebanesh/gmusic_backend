@@ -278,8 +278,40 @@ export function createGroupListeningRouter({
           durationMs > MAX_POSITION_MS) {
         throw apiError(400, 'invalid_group_queue');
       }
-      await verifyTrackAccess(req, trackIds, getAccessibleTracks);
       const device = await onlineDevice(collection, req.user.id, deviceId, time);
+      const existingRoom = await groups().findOne({
+        status: { $ne: 'ended' },
+        expiresAt: { $gt: time },
+        members: {
+          $elemMatch: { userId: req.user.id, deviceId },
+        },
+      });
+      if (existingRoom) {
+        await verifyRoomTrackAccess(
+          req,
+          existingRoom,
+          existingRoom.trackIds,
+          getAccessibleTracks,
+        );
+        const { room: recoveredRoom } = await requireMember(
+          groups(),
+          String(existingRoom._id),
+          req.user.id,
+          deviceId,
+          time,
+        );
+        await claimPlaybackDeviceForGroup({
+          userId: req.user.id,
+          deviceId,
+          groupSessionId: String(recoveredRoom._id),
+          groupSessionExpiresAt: recoveredRoom.expiresAt,
+          collection,
+          now,
+        });
+        res.json({ room: publicRoom(recoveredRoom, time), recovered: true });
+        return;
+      }
+      await verifyTrackAccess(req, trackIds, getAccessibleTracks);
       const member = createMember(req, device, time);
       let room;
       for (let attempt = 0; attempt < 3; attempt += 1) {

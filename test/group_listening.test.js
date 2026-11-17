@@ -501,6 +501,31 @@ test('group sessions authorize each account and schedule after every online play
     assert.equal(guestHeartbeat.body.room.hostMemberId, guestMemberId);
     assert.equal(guestHeartbeat.body.driftMs, 3_000);
 
+    const paused = await request(`/group-listening/${sessionId}/control`, {
+      user: 'guest',
+      method: 'POST',
+      body: { deviceId: guestDeviceId, action: 'pause' },
+    });
+    assert.equal(paused.response.status, 200);
+    assert.equal(paused.body.room.playing, false);
+    assert.equal(paused.body.room.status, 'paused');
+    assert.equal(
+      new Date(paused.body.room.startAtServerTime).getTime() - time.getTime(),
+      1_500,
+    );
+    const repeatedPause = await request(
+      `/group-listening/${sessionId}/control`,
+      {
+        user: 'guest',
+        method: 'POST',
+        body: { deviceId: guestDeviceId, action: 'pause' },
+      },
+    );
+    assert.equal(
+      repeatedPause.body.room.startAtServerTime,
+      paused.body.room.startAtServerTime,
+    );
+
     const left = await request(`/group-listening/${sessionId}/leave`, {
       user: 'guest',
       method: 'POST',

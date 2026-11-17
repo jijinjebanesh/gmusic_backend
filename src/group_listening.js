@@ -19,6 +19,7 @@ const MAX_QUEUE_SIZE = 500;
 const MEMBER_ONLINE_MS = 12_000;
 const MEMBER_READY_MS = 6_000;
 const MIN_GROUP_BUFFER_MS = 2_000;
+const GROUP_PAUSE_LEAD_MS = 1_500;
 const ROOM_TTL_MS = 24 * 60 * 60_000;
 const MAX_POSITION_MS = 86_400_000;
 
@@ -633,13 +634,21 @@ export function createGroupListeningRouter({
               startAtServerTime: null,
             }, time);
           case 'pause':
-            return {
-              ...current,
-              playing: false,
-              status: 'paused',
-              positionMs: currentPosition,
-              startAtServerTime: null,
-            };
+            if (!current.playing) return current;
+            {
+              const pauseAt = new Date(time.getTime() + GROUP_PAUSE_LEAD_MS);
+              const positionMs = roomPosition(current, time) +
+                GROUP_PAUSE_LEAD_MS;
+              return {
+                ...current,
+                playing: false,
+                status: 'paused',
+                positionMs: current.durationMs > 0
+                  ? Math.min(positionMs, current.durationMs)
+                  : positionMs,
+                startAtServerTime: pauseAt.toISOString(),
+              };
+            }
           case 'seek': {
             const positionMs = req.body?.positionMs;
             if (!Number.isSafeInteger(positionMs) || positionMs < 0 ||

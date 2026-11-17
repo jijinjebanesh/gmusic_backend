@@ -271,6 +271,7 @@ test('group Socket.IO rooms are available only to registered room members', asyn
       sessionId: String(sessionId),
     });
     assert.equal(authorized.ok, true, JSON.stringify(authorized));
+    assert.equal(authorized.crossInstance, false);
     assert.equal(denied.ok, false);
     assert.equal(denied.error, 'not_a_group_member');
 

@@ -103,6 +103,9 @@ drift locally. This is best-effort synchronization, not sample-accurate or
 acoustic-latency synchronization over arbitrary devices and networks.
 If a room-creation response is lost, retrying creation on the same device
 resumes its existing active room instead of creating a duplicate.
+The group Socket.IO watch response reports whether events are shared across
+instances so clients can use faster REST synchronization when Redis Pub/Sub is
+unavailable.
 
 A device claimed by a group cannot be targeted by Connected Playback commands,
 handoffs, or device disconnect/forget operations. Its personal account session

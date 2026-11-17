@@ -8,6 +8,7 @@ import {
 } from './playback.js';
 import {
   groupRoom,
+  playbackEventsAreShared,
   publishGroupEvent,
   removeGroupDeviceFromRoom,
   removeGroupRoomSockets,
@@ -894,7 +895,11 @@ export function attachGroupListeningSocketHandlers(
         );
         await socket.join(groupRoom(String(roomId)));
         if (typeof callback === 'function') {
-          callback({ ok: true, room: publicRoom(room, time) });
+          callback({
+            ok: true,
+            crossInstance: playbackEventsAreShared(),
+            room: publicRoom(room, time),
+          });
         }
       } catch (error) {
         if (typeof callback === 'function') {

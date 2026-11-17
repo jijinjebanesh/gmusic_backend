@@ -3,7 +3,11 @@ import assert from 'node:assert/strict';
 import express from 'express';
 import { createServer } from 'node:http';
 import { ObjectId } from 'mongodb';
-import { createPlaybackRouter, pollPlayback } from '../src/playback.js';
+import {
+  createPlaybackCommand,
+  createPlaybackRouter,
+  pollPlayback,
+} from '../src/playback.js';
 
 class MemoryCollection {
   constructor() {
@@ -141,6 +145,241 @@ test('playback polling releases an expired group claim before personal playback 
   });
   assert.equal(device.groupSessionId, undefined);
   assert.equal(device.groupSessionExpiresAt, undefined);
+});
+
+test('a live device can claim playback when the paused owner has gone offline', async () => {
+  const database = new MemoryDatabase();
+  const time = new Date('2026-11-18T00:00:00.000Z');
+  const localDeviceId = '0123456789abcdef0123456789abcdef';
+  const offlineDeviceId = 'abcdef0123456789abcdef0123456789';
+  await database.collection('playback_devices').insertOne({
+    userId: 'user-a',
+    deviceId: offlineDeviceId,
+    name: 'Offline Web player',
+    platform: 'web',
+    lastSeenAt: new Date(time.getTime() - 13_000),
+  });
+  await database.collection('playback_sessions').insertOne({
+    _id: 'user-a',
+    userId: 'user-a',
+    activeDeviceId: offlineDeviceId,
+    trackIds: ['stale-track'],
+    index: 0,
+    positionMs: 21_000,
+    durationMs: 180_000,
+    playing: false,
+    shuffle: false,
+    repeat: 'none',
+    title: 'Stale track',
+    artist: 'Old artist',
+    queueRevision: 1,
+    revision: 1,
+    playbackEpoch: 1,
+    resumeOnFailover: false,
+  });
+
+  const result = await pollPlayback({
+    userId: 'user-a',
+    collection: (name) => database.collection(name),
+    now: () => time,
+    body: {
+      deviceId: localDeviceId,
+      name: 'Android device',
+      platform: 'android',
+      claim: true,
+      snapshot: {
+        trackIds: ['actual-track'],
+        index: 0,
+        positionMs: 4_000,
+        durationMs: 200_000,
+        volume: 1,
+        playing: true,
+        shuffle: false,
+        repeat: 'none',
+        title: 'Actual track',
+        artist: 'Current artist',
+      },
+    },
+  });
+
+  assert.equal(result.session.activeDeviceId, localDeviceId);
+  assert.deepEqual(result.session.trackIds, ['actual-track']);
+  assert.equal(result.session.title, 'Actual track');
+  assert.equal(result.session.playing, true);
+  assert.equal(
+    (
+      await database.collection('playback_sessions').findOne({ _id: 'user-a' })
+    ).resumeOnFailover,
+    false,
+  );
+});
+
+test('a live paused remote owner cannot be claimed by another device', async () => {
+  const database = new MemoryDatabase();
+  const time = new Date('2026-11-18T00:00:00.000Z');
+  const activeDeviceId = '0123456789abcdef0123456789abcdef';
+  const otherDeviceId = 'abcdef0123456789abcdef0123456789';
+  await database.collection('playback_devices').insertOne({
+    userId: 'user-a',
+    deviceId: activeDeviceId,
+    name: 'Online Web player',
+    platform: 'web',
+    lastSeenAt: time,
+  });
+  await database.collection('playback_sessions').insertOne({
+    _id: 'user-a',
+    userId: 'user-a',
+    activeDeviceId,
+    trackIds: ['active-track'],
+    index: 0,
+    positionMs: 21_000,
+    durationMs: 180_000,
+    playing: false,
+    shuffle: false,
+    repeat: 'none',
+    title: 'Active track',
+    artist: 'Current artist',
+    queueRevision: 1,
+    revision: 1,
+    playbackEpoch: 1,
+    resumeOnFailover: false,
+  });
+
+  const result = await pollPlayback({
+    userId: 'user-a',
+    collection: (name) => database.collection(name),
+    now: () => time,
+    body: {
+      deviceId: otherDeviceId,
+      name: 'Android device',
+      platform: 'android',
+      claim: true,
+      snapshot: {
+        trackIds: ['other-track'],
+        index: 0,
+        positionMs: 4_000,
+        durationMs: 200_000,
+        volume: 1,
+        playing: true,
+        shuffle: false,
+        repeat: 'none',
+        title: 'Other track',
+        artist: 'Other artist',
+      },
+    },
+  });
+
+  assert.equal(result.session.activeDeviceId, activeDeviceId);
+  assert.deepEqual(result.session.trackIds, ['active-track']);
+  assert.equal(result.session.playing, false);
+});
+
+test('clearing an offline remote queue clears its owner and cached track', async () => {
+  const database = new MemoryDatabase();
+  const time = new Date('2026-11-18T00:00:00.000Z');
+  const offlineDeviceId = '0123456789abcdef0123456789abcdef';
+  await database.collection('playback_devices').insertOne({
+    userId: 'user-a',
+    deviceId: offlineDeviceId,
+    name: 'Offline Web player',
+    platform: 'web',
+    lastSeenAt: new Date(time.getTime() - 13_000),
+  });
+  await database.collection('playback_sessions').insertOne({
+    _id: 'user-a',
+    userId: 'user-a',
+    activeDeviceId: offlineDeviceId,
+    trackIds: ['stale-track'],
+    index: 0,
+    positionMs: 21_000,
+    durationMs: 180_000,
+    playing: false,
+    shuffle: false,
+    repeat: 'none',
+    title: 'Stale track',
+    artist: 'Old artist',
+    queueRevision: 1,
+    revision: 1,
+    playbackEpoch: 1,
+    resumeOnFailover: false,
+  });
+
+  const command = await createPlaybackCommand({
+    userId: 'user-a',
+    action: 'queueClear',
+    payload: {},
+    collection: (name) => database.collection(name),
+    now: () => time,
+  });
+  const session = await database.collection('playback_sessions').findOne({
+    _id: 'user-a',
+  });
+  const storedCommand = await database.collection('playback_commands').findOne({
+    _id: new ObjectId(command.commandId),
+  });
+
+  assert.equal(session.activeDeviceId, null);
+  assert.deepEqual(session.trackIds, []);
+  assert.equal(session.playing, false);
+  assert.equal(storedCommand.status, 'ok');
+});
+
+test('an active device releases remote ownership when its queue is cleared', async () => {
+  const database = new MemoryDatabase();
+  const time = new Date('2026-11-18T00:00:00.000Z');
+  const deviceId = '0123456789abcdef0123456789abcdef';
+  await database.collection('playback_devices').insertOne({
+    userId: 'user-a',
+    deviceId,
+    name: 'Web player',
+    platform: 'web',
+    lastSeenAt: time,
+  });
+  await database.collection('playback_sessions').insertOne({
+    _id: 'user-a',
+    userId: 'user-a',
+    activeDeviceId: deviceId,
+    trackIds: ['current-track'],
+    index: 0,
+    positionMs: 21_000,
+    durationMs: 180_000,
+    playing: false,
+    shuffle: false,
+    repeat: 'none',
+    title: 'Current track',
+    artist: 'Current artist',
+    queueRevision: 1,
+    revision: 1,
+    playbackEpoch: 1,
+    resumeOnFailover: false,
+  });
+
+  const result = await pollPlayback({
+    userId: 'user-a',
+    collection: (name) => database.collection(name),
+    now: () => time,
+    body: {
+      deviceId,
+      name: 'Web player',
+      platform: 'web',
+      snapshot: {
+        trackIds: [],
+        index: 0,
+        positionMs: 0,
+        durationMs: 0,
+        volume: 1,
+        playing: false,
+        shuffle: false,
+        repeat: 'none',
+        title: '',
+        artist: '',
+      },
+    },
+  });
+
+  assert.equal(result.session.activeDeviceId, null);
+  assert.deepEqual(result.session.trackIds, []);
+  assert.equal(result.session.playing, false);
 });
 
 test('playback polling, handoff, commands, and device visibility are account-scoped', async () => {

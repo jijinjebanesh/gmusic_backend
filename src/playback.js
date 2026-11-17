@@ -264,11 +264,18 @@ async function updateSession(
     queueChanged = false,
     advancePlaybackEpoch = false,
     updatedAt = new Date(),
+    expectedRevision = null,
   } = {},
 ) {
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const current = await sessions.findOne({ _id: userId });
     if (!current) throw apiError(409, 'playback_session_missing');
+    if (
+      expectedRevision !== null &&
+      (current.revision || 0) !== expectedRevision
+    ) {
+      throw apiError(409, 'playback_conflict');
+    }
     const epochChanged =
       advancePlaybackEpoch ||
       (Object.hasOwn(fields, 'activeDeviceId') &&
@@ -306,7 +313,9 @@ async function updateSession(
 }
 
 async function pauseExpiredPlayback(collection, userId, session, time) {
-  if (!session?.activeDeviceId || !session.playing) return session;
+  if (!session?.activeDeviceId || session.resumeOnFailover === true) {
+    return session;
+  }
   const active = await collection('playback_devices').findOne({
     userId,
     deviceId: session.activeDeviceId,
@@ -320,7 +329,10 @@ async function pauseExpiredPlayback(collection, userId, session, time) {
   return updateSession(
     collection('playback_sessions'),
     userId,
-    { playing: false, resumeOnFailover: true },
+    {
+      ...(session.playing ? { playing: false } : {}),
+      resumeOnFailover: true,
+    },
     { updatedAt: time },
   );
 }
@@ -458,10 +470,15 @@ export async function pollPlayback({
   ) {
     const queueChanged = JSON.stringify(session.trackIds || []) !==
       JSON.stringify(snapshot.trackIds) || session.index !== snapshot.index;
+    const snapshotFields = sessionFields(snapshot);
+    if (snapshot.trackIds.length === 0) {
+      snapshotFields.activeDeviceId = null;
+      snapshotFields.resumeOnFailover = false;
+    }
     session = await updateSession(
       sessions,
       userId,
-      sessionFields(snapshot),
+      snapshotFields,
       {
         queueChanged,
         advancePlaybackEpoch: snapshot.advancePlaybackEpoch,
@@ -666,13 +683,63 @@ export async function createPlaybackCommand({
     throw apiError(400, 'invalid_command');
   }
   const deviceId = session.activeDeviceId;
+  const time = now();
   const device = await collection('playback_devices').findOne({
     userId,
     deviceId,
-    lastSeenAt: { $gte: new Date(now().getTime() - DEVICE_ONLINE_MS) },
   });
-  if (!device) throw apiError(409, 'device_offline');
-  if (deviceInGroupSession(device, now())) {
+  const deviceOnline =
+    device &&
+    time.getTime() - new Date(device.lastSeenAt).getTime() <= DEVICE_ONLINE_MS;
+  if (!deviceOnline) {
+    if (
+      ['stop', 'queueClear'].includes(commandAction) &&
+      !deviceInGroupSession(device, time)
+    ) {
+      const stoppedSession = await updateSession(
+        collection('playback_sessions'),
+        userId,
+        {
+          activeDeviceId: null,
+          trackIds: [],
+          index: 0,
+          positionMs: 0,
+          durationMs: 0,
+          playing: false,
+          resumeOnFailover: false,
+          title: '',
+          artist: '',
+        },
+        {
+          queueChanged: true,
+          advancePlaybackEpoch: true,
+          updatedAt: time,
+          expectedRevision: session.revision || 0,
+        },
+      );
+      const inserted = await commands.insertOne({
+        userId,
+        deviceId,
+        action: commandAction,
+        payload: commandPayloadValue,
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+        status: 'ok',
+        createdAt: time,
+        completedAt: time,
+      });
+      publishPlaybackEvent(userId, {
+        session: publicSession(stoppedSession, time),
+        serverTimestamp: time.toISOString(),
+      });
+      return {
+        commandId: String(inserted.insertedId),
+        deviceId,
+        duplicate: false,
+      };
+    }
+    throw apiError(409, 'device_offline');
+  }
+  if (deviceInGroupSession(device, time)) {
     throw apiError(409, 'device_in_group_session');
   }
   const requiredCapability = commandAction === 'volume'
@@ -687,7 +754,7 @@ export async function createPlaybackCommand({
   if (device.capabilities?.[requiredCapability] === false) {
     throw apiError(409, 'capability_unavailable');
   }
-  const createdAt = now();
+  const createdAt = time;
   const deadlineAt = new Date(createdAt.getTime() + COMMAND_TTL_MS);
   let inserted;
   try {

@@ -103,6 +103,7 @@ function publicRoom(room, time) {
     invitationCode: room.code,
     title: room.title,
     hostMemberId: room.hostMemberId,
+    hostDeviceId: room.hostDeviceId,
     status,
     trackIds: room.trackIds,
     index: room.index,

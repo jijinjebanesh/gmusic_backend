@@ -269,6 +269,7 @@ test('group sessions authorize each account and schedule after every online play
       },
     });
     assert.equal(created.response.status, 201);
+    assert.equal(created.body.room.hostDeviceId, hostDeviceId);
     const sessionId = created.body.room.sessionId;
     const invitationCode = created.body.room.invitationCode;
 
@@ -630,6 +631,7 @@ test('group sessions authorize each account and schedule after every online play
     );
     assert.equal(guestHeartbeat.response.status, 200);
     assert.equal(guestHeartbeat.body.room.hostMemberId, guestMemberId);
+    assert.equal(guestHeartbeat.body.room.hostDeviceId, guestDeviceId);
     assert.equal(guestHeartbeat.body.driftMs, 3_000);
 
     const paused = await request(`/group-listening/${sessionId}/control`, {
@@ -717,6 +719,7 @@ test('group sessions authorize each account and schedule after every online play
     assert.equal(hostLeave.response.status, 200);
     assert.notEqual(hostLeave.body.room.status, 'ended');
     assert.equal(hostLeave.body.room.hostMemberId, newGuestMemberId);
+    assert.equal(hostLeave.body.room.hostDeviceId, guestDeviceId);
 
     const ended = await request(
       `/group-listening/${newRoomId}/control`,

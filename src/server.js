@@ -65,7 +65,8 @@ app.use(pinoHttp({
 }));
 const apiToken = process.env.MORNYE_API_TOKEN;
 if (!apiToken || apiToken.length < 32) throw new Error('Set MORNYE_API_TOKEN to a random value of at least 32 characters');
-const port = Number(process.env.PORT || 43821);
+const port = Number(process.env.PORT || 3000);
+const host = process.env.HOST || '0.0.0.0';
 const onVercel = Boolean(process.env.VERCEL);
 const driveMode = process.env.GMUSIC_DRIVE_MODE === 'per_user' ? 'per_user' : 'shared';
 // Prefer Vercel's stable production domain over its per-deployment URL.
@@ -529,8 +530,8 @@ attachPlaybackSocketIO(server, { apiToken });
 // Local run: this process owns the port. Vercel exports the same HTTP server
 // so its Function runtime can handle Socket.IO WebSocket upgrades.
 if (!onVercel) {
-  server.listen(port, process.env.HOST || '127.0.0.1', () => {
-    console.log(`Mornye Drive bridge listening on ${process.env.HOST || '127.0.0.1'}:${port}`);
+  server.listen(port, host, () => {
+    console.log(`Mornye Drive bridge listening on ${host}:${port}`);
     console.log(`OAuth redirect URI: ${redirectUri}`);
   });
 }

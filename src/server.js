@@ -3,7 +3,12 @@ import express from 'express';
 import { createServer } from 'node:http';
 import helmet from 'helmet';
 import pinoHttp from 'pino-http';
-import { readInstalledCredentials, createDriveSession, createDisabledDrive } from './drive.js';
+import {
+  MAX_COVER_ART_SCAN_BYTES,
+  readInstalledCredentials,
+  createDriveSession,
+  createDisabledDrive,
+} from './drive.js';
 import { col, initDb, mongoEnabled } from './db.js';
 import { authRoutes, userDataRoutes, attachUser } from './auth.js';
 import { playbackRoutes } from './playback.js';
@@ -32,7 +37,9 @@ import {
   listTracks,
 } from './catalog.js';
 import { getDriveIndexStatus, syncDriveBatch } from './indexer.js';
+import { createDriveSyncScheduler } from './drive_sync_scheduler.js';
 import { resolveOAuthRedirectUri } from './oauth_redirect_uri.js';
+import { normalizeStreamHeaders } from './stream_headers.js';
 
 const app = express();
 app.disable('x-powered-by');
@@ -41,8 +48,9 @@ app.set('trust proxy', true);
 // origin differs from this loopback service, so respond with permissive CORS.
 app.use((req, res, next) => {
   res.setHeader('access-control-allow-origin', '*');
-  res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS');
+  res.setHeader('access-control-allow-methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
   res.setHeader('access-control-allow-headers', 'authorization,content-type,range');
+  res.setHeader('access-control-expose-headers', 'content-length,content-range,accept-ranges');
   if (req.method === 'OPTIONS') return res.status(204).end();
   next();
 });
@@ -163,6 +171,57 @@ async function driveForOwner(ownerId) {
   return driveConnections.getDrive(ownerId);
 }
 const requestDrive = (req) => driveForOwner(driveOwner(req));
+const AUTO_SYNC_BATCH_LIMIT = 8;
+const driveSyncRuns = new Map();
+
+async function withDriveSyncLock(ownerId, sync) {
+  const active = driveSyncRuns.get(ownerId);
+  if (active) return active;
+  const run = Promise.resolve().then(sync);
+  driveSyncRuns.set(ownerId, run);
+  try {
+    return await run;
+  } finally {
+    if (driveSyncRuns.get(ownerId) === run) driveSyncRuns.delete(ownerId);
+  }
+}
+
+async function syncOwnerAutomatically(userDrive, ownerId) {
+  let status;
+  for (let batch = 0; batch < AUTO_SYNC_BATCH_LIMIT; batch += 1) {
+    status = await syncDriveBatch(userDrive, { ownerId });
+    if (status.status !== 'scanning' && status.status !== 'synchronizing') break;
+  }
+  return status;
+}
+
+async function runAutomaticDriveSync() {
+  if (!mongoEnabled()) return;
+  if (driveMode === 'shared') {
+    if (drive.authorized) {
+      await withDriveSyncLock('shared', () => syncOwnerAutomatically(drive, 'shared'));
+    }
+    return;
+  }
+
+  const connections = await col('drive_connections')
+    .find({ encryptedTokens: { $exists: true } }, { projection: { userId: 1 } })
+    .toArray();
+  for (const { userId } of connections) {
+    try {
+      const ownerId = String(userId);
+      const userDrive = await driveConnections.getDrive(ownerId);
+      await withDriveSyncLock(ownerId, () => syncOwnerAutomatically(userDrive, ownerId));
+    } catch (error) {
+      const code = error?.code || error?.name || 'sync_error';
+      console.error(`Automatic Drive sync failed for a connected account (${code})`);
+    }
+  }
+}
+
+const driveSyncScheduler = createDriveSyncScheduler({
+  run: runAutomaticDriveSync,
+});
 // Absolute stream/art URLs: trust Vercel's forwarding headers, else loopback.
 function publicOrigin(req) {
   const proto = req.get('x-forwarded-proto') || req.protocol || 'http';
@@ -271,7 +330,9 @@ app.post('/api/v1/drive/sync', async (req, res, next) => {
   try {
     const ownerId = driveOwner(req);
     const userDrive = await requestDrive(req);
-    res.json(await syncDriveBatch(userDrive, { ownerId }));
+    res.json(await withDriveSyncLock(ownerId, () =>
+      syncDriveBatch(userDrive, { ownerId }),
+    ));
   } catch (error) { next(error); }
 });
 app.post('/api/v1/drive/oauth/start', async (req, res, next) => {
@@ -314,21 +375,21 @@ app.get('/api/v1/tracks', async (req, res, next) => {
     const userDrive = await requestDrive(req);
     const ownerId = driveOwner(req);
     const page = await userDrive.listTracks({ query: String(req.query.q || ''), pageToken: req.query.pageToken ? String(req.query.pageToken) : undefined, pageSize: req.query.pageSize });
-    const expiresAt = Date.now() + 8 * 60 * 60_000;
-    const files = page.files.map((file) => ({
-      ...file,
-      streamUrl: `${publicOrigin(req)}/stream/${signTicket(file.id, ownerId, expiresAt)}`,
-    }));
+    const files = page.files.map((file) => ({ ...file, ...mediaUrls(req, file.id, ownerId) }));
     res.json({ ...page, files });
   } catch (err) { next(err); }
 });
-function withStreamUrl(req, track) {
+function mediaUrls(req, fileId, ownerId) {
   const expiresAt = Date.now() + 8 * 60 * 60_000;
-  const ownerId = driveOwner(req);
+  const origin = publicOrigin(req);
+  const ticket = signTicket(fileId, ownerId, expiresAt);
   return {
-    ...track,
-    streamUrl: `${publicOrigin(req)}/stream/${signTicket(track.id, ownerId, expiresAt)}`,
+    streamUrl: `${origin}/stream/${ticket}`,
+    artworkUrl: `${origin}/art/${ticket}`,
   };
+}
+function withMediaUrls(req, track) {
+  return { ...track, ...mediaUrls(req, track.id, driveOwner(req)) };
 }
 app.get('/api/v1/catalog/tracks', async (req, res, next) => {
   try {
@@ -338,7 +399,7 @@ app.get('/api/v1/catalog/tracks', async (req, res, next) => {
       pageToken: req.query.pageToken,
       ownerId: driveOwner(req),
     });
-    res.json({ ...page, files: page.files.map((track) => withStreamUrl(req, track)) });
+    res.json({ ...page, files: page.files.map((track) => withMediaUrls(req, track)) });
   } catch (error) { next(error); }
 });
 app.post('/api/v1/catalog/tracks/resolve', async (req, res, next) => {
@@ -349,14 +410,14 @@ app.post('/api/v1/catalog/tracks/resolve', async (req, res, next) => {
       return res.status(400).json({ error: 'invalid_track_ids' });
     }
     const tracks = await getTracksByIds(ids, driveOwner(req));
-    res.json({ files: tracks.map((track) => withStreamUrl(req, track)) });
+    res.json({ files: tracks.map((track) => withMediaUrls(req, track)) });
   } catch (error) { next(error); }
 });
 app.get('/api/v1/catalog/tracks/:id', async (req, res, next) => {
   try {
     const track = await getTrack(req.params.id, driveOwner(req));
     if (!track) return res.status(404).json({ error: 'track_not_found' });
-    res.json({ track: withStreamUrl(req, track) });
+    res.json({ track: withMediaUrls(req, track) });
   } catch (error) { next(error); }
 });
 app.get('/api/v1/catalog/tracks/:id/lyrics', async (req, res, next) => {
@@ -372,7 +433,7 @@ app.get('/api/v1/artists', async (req, res, next) => {
 app.get('/api/v1/artists/:id/tracks', async (req, res, next) => {
   try {
     const page = await artistTracks(req.params.id, { ...req.query, ownerId: driveOwner(req) });
-    res.json({ ...page, files: page.files.map((track) => withStreamUrl(req, track)) });
+    res.json({ ...page, files: page.files.map((track) => withMediaUrls(req, track)) });
   } catch (error) { next(error); }
 });
 app.get('/api/v1/artists/:id/albums', async (req, res, next) => {
@@ -391,7 +452,7 @@ app.get('/api/v1/albums', async (req, res, next) => {
 app.get('/api/v1/albums/:id/tracks', async (req, res, next) => {
   try {
     const page = await albumTracks(req.params.id, { ...req.query, ownerId: driveOwner(req) });
-    res.json({ ...page, files: page.files.map((track) => withStreamUrl(req, track)) });
+    res.json({ ...page, files: page.files.map((track) => withMediaUrls(req, track)) });
   } catch (error) { next(error); }
 });
 app.get('/api/v1/albums/:id', async (req, res, next) => {
@@ -407,7 +468,7 @@ app.get('/api/v1/genres', async (req, res, next) => {
 app.get('/api/v1/genres/:id/tracks', async (req, res, next) => {
   try {
     const page = await genreTracks(req.params.id, { ...req.query, ownerId: driveOwner(req) });
-    res.json({ ...page, files: page.files.map((track) => withStreamUrl(req, track)) });
+    res.json({ ...page, files: page.files.map((track) => withMediaUrls(req, track)) });
   } catch (error) { next(error); }
 });
 app.get('/api/v1/search', async (req, res, next) => {
@@ -420,7 +481,7 @@ app.get('/api/v1/search', async (req, res, next) => {
       listAlbums({ query, pageSize: req.query.pageSize, ownerId }),
     ]);
     res.json({
-      tracks: tracks.files.map((track) => withStreamUrl(req, track)),
+      tracks: tracks.files.map((track) => withMediaUrls(req, track)),
       nextPageToken: tracks.nextPageToken,
       artists: artists.artists,
       albums: albums.albums,
@@ -439,7 +500,7 @@ function artHandler() {
       const art = await cachedCoverArt(userDrive, ticket.id, ticket.ownerId);
       if (!art) return res.status(404).end();
       res.setHeader('content-type', art.contentType);
-      res.setHeader('cache-control', 'private, max-age=86400');
+      res.setHeader('cache-control', 'private, max-age=28800');
       res.send(art.data);
     } catch (err) { next(err); }
   };
@@ -457,7 +518,7 @@ async function cachedCoverArt(driveSession, fileId, ownerId) {
     }
   }
   const art = await driveSession.coverArt(fileId);
-  if (art && mongoEnabled() && art.data.length <= 2 * 1024 * 1024) {
+  if (art && mongoEnabled() && art.data.length <= MAX_COVER_ART_SCAN_BYTES) {
     await col('artwork_cache').updateOne(
       { _id: cacheId },
       {
@@ -494,8 +555,14 @@ app.get('/stream/:ticket', allowCrossOriginMedia, async (req, res, next) => {
     const userDrive = await driveForOwner(ticket.ownerId);
     const result = await userDrive.openFile(ticket.id, req.get('range'));
     res.status(result.status);
-    for (const [key, value] of Object.entries(result.headers)) res.setHeader(key, value);
+    for (const [key, value] of Object.entries(normalizeStreamHeaders(result.headers))) {
+      res.setHeader(key, value);
+    }
+    if (!res.getHeader('accept-ranges')) res.setHeader('accept-ranges', 'bytes');
     result.stream.on('error', next);
+    res.on('close', () => {
+      if (!res.writableEnded) result.stream.destroy();
+    });
     result.stream.pipe(res);
   } catch (err) { next(err); }
 });
@@ -504,8 +571,14 @@ app.get('/api/v1/tracks/:id/stream', allowCrossOriginMedia, async (req, res, nex
     const userDrive = await requestDrive(req);
     const result = await userDrive.openFile(req.params.id, req.get('range'));
     res.status(result.status);
-    for (const [key, value] of Object.entries(result.headers)) res.setHeader(key, value);
+    for (const [key, value] of Object.entries(normalizeStreamHeaders(result.headers))) {
+      res.setHeader(key, value);
+    }
+    if (!res.getHeader('accept-ranges')) res.setHeader('accept-ranges', 'bytes');
     result.stream.on('error', next);
+    res.on('close', () => {
+      if (!res.writableEnded) result.stream.destroy();
+    });
     result.stream.pipe(res);
   } catch (err) { next(err); }
 });
@@ -533,6 +606,7 @@ if (!onVercel) {
   server.listen(port, host, () => {
     console.log(`Mornye Drive bridge listening on ${host}:${port}`);
     console.log(`OAuth redirect URI: ${redirectUri}`);
+    driveSyncScheduler.start();
   });
 }
 

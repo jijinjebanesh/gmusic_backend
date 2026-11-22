@@ -4,9 +4,14 @@ import express from 'express';
 import { createServer } from 'node:http';
 import { ObjectId } from 'mongodb';
 import {
+  acknowledgePlaybackCommand,
   createPlaybackCommand,
+  createPlaybackHandoff,
+  createPlaybackPrewarm,
   createPlaybackRouter,
+  cancelPlaybackPrewarm,
   pollPlayback,
+  updatePlaybackPrewarmStatus,
 } from '../src/playback.js';
 
 class MemoryCollection {
@@ -19,7 +24,7 @@ class MemoryCollection {
       if (key === '$or') {
         return expected.some((condition) => this.matches(document, condition));
       }
-      const actual = document[key];
+      const actual = key.split('.').reduce((value, part) => value?.[part], document);
       if (expected && typeof expected === 'object' && !Array.isArray(expected)) {
         if ('$exists' in expected) {
           return (actual !== undefined) === expected.$exists;
@@ -53,7 +58,16 @@ class MemoryCollection {
     }
     if (!document) return { matchedCount: 0 };
     if (!matchedCount) Object.assign(document, update.$setOnInsert || {});
-    Object.assign(document, update.$set || {});
+    for (const [key, value] of Object.entries(update.$set || {})) {
+      const parts = key.split('.');
+      let target = document;
+      while (parts.length > 1) {
+        const part = parts.shift();
+        target[part] ??= {};
+        target = target[part];
+      }
+      target[parts[0]] = value;
+    }
     for (const key of Object.keys(update.$unset || {})) delete document[key];
     for (const [key, increment] of Object.entries(update.$inc || {})) {
       document[key] = (document[key] || 0) + increment;
@@ -102,6 +116,306 @@ class MemoryDatabase {
   }
 }
 
+test('Connect prewarm targets one eligible device without changing playback ownership', async () => {
+  const database = new MemoryDatabase();
+  const now = new Date('2026-11-20T12:00:00.000Z');
+  const requesterDeviceId = '0123456789abcdef0123456789abcdef';
+  const destinationDeviceId = 'abcdef0123456789abcdef0123456789';
+  database.collection('playback_sessions').documents.push({
+    _id: 'user-a', activeDeviceId: requesterDeviceId,
+    trackIds: ['track-a', 'track-b'], index: 0, positionMs: 42_000,
+    durationMs: 180_000, playing: true, queueRevision: 7, revision: 11,
+    stateVersion: 11, volume: 1, shuffle: false, repeat: 'none',
+  });
+  database.collection('playback_devices').documents.push({
+    userId: 'user-a', deviceId: destinationDeviceId, lastSeenAt: now,
+    capabilities: { playback: true },
+  });
+  const result = await createPlaybackPrewarm({
+    userId: 'user-a', requesterDeviceId, deviceId: destinationDeviceId,
+    prewarmId: 'warm-switch-00000001',
+    collection: (name) => database.collection(name), now: () => now,
+  });
+  assert.equal(result.status, 'pending');
+  const commands = database.collection('playback_commands').documents;
+  assert.equal(commands.length, 1);
+  assert.equal(commands[0].deviceId, destinationDeviceId);
+  assert.equal(commands[0].action, 'prewarm');
+  assert.equal(commands[0].payload.prewarmId, 'warm-switch-00000001');
+  assert.equal(commands[0].payload.queueRevision, 7);
+  assert.equal(commands[0].payload.trackId, 'track-a');
+  assert.equal(commands[0].payload.positionMs, 42_000);
+  assert.equal(commands[0].payload.playbackRate, 1);
+  assert.equal(
+    commands[0].deadlineAt.getTime() - commands[0].createdAt.getTime(),
+    60_000,
+  );
+  assert.equal(commands[0].payload.session.trackIds[commands[0].payload.session.index], 'track-a');
+  assert.equal(database.collection('playback_sessions').documents[0].activeDeviceId, requesterDeviceId);
+  commands[0].payload.prewarmStatus = 'ready';
+  const transfer = await createPlaybackHandoff({
+    userId: 'user-a', deviceId: destinationDeviceId,
+    prewarmId: 'warm-switch-00000001',
+    collection: (name) => database.collection(name), now: () => now,
+  });
+  assert.equal(transfer.status, 'pending');
+  const handoffCommand = database.collection('playback_commands').documents[1];
+  assert.equal(handoffCommand.action, 'handoff');
+  assert.equal(handoffCommand.payload.prewarmId, 'warm-switch-00000001');
+});
+
+test('Connect prewarm status is correlated to the preparing destination', async () => {
+  const database = new MemoryDatabase();
+  const now = new Date('2026-11-20T12:00:00.000Z');
+  const requesterDeviceId = '0123456789abcdef0123456789abcdef';
+  const destinationDeviceId = 'abcdef0123456789abcdef0123456789';
+  database.collection('playback_commands').documents.push({
+    _id: new ObjectId(),
+    userId: 'user-a',
+    deviceId: destinationDeviceId,
+    action: 'prewarm',
+    payload: {
+      prewarmId: 'warm-switch-00000001',
+      requesterDeviceId,
+    },
+    status: 'pending',
+    createdAt: now,
+    deadlineAt: new Date(now.getTime() + 60_000),
+  });
+  const result = await updatePlaybackPrewarmStatus({
+    userId: 'user-a',
+    deviceId: destinationDeviceId,
+    prewarmId: 'warm-switch-00000001',
+    status: 'ready',
+    collection: (name) => database.collection(name),
+    now: () => now,
+  });
+  assert.equal(result.stale, false);
+  assert.equal(result.requesterDeviceId, requesterDeviceId);
+  assert.equal(result.status, 'ready');
+  assert.equal(
+    database.collection('playback_commands').documents[0].payload.prewarmStatus,
+    'ready',
+  );
+});
+
+test('Connect prewarm cancellation is requester scoped and rejects stale status', async () => {
+  const database = new MemoryDatabase();
+  const now = new Date('2026-11-20T12:00:00.000Z');
+  const requesterDeviceId = '0123456789abcdef0123456789abcdef';
+  const destinationDeviceId = 'abcdef0123456789abcdef0123456789';
+  database.collection('playback_commands').documents.push({
+    _id: new ObjectId(),
+    userId: 'user-a',
+    deviceId: destinationDeviceId,
+    action: 'prewarm',
+    payload: {
+      prewarmId: 'warm-switch-00000001',
+      requesterDeviceId,
+    },
+    status: 'pending',
+    createdAt: now,
+    deadlineAt: new Date(now.getTime() + 60_000),
+  });
+  const denied = await cancelPlaybackPrewarm({
+    userId: 'user-a',
+    requesterDeviceId: 'ffffffffffffffffffffffffffffffff',
+    deviceId: destinationDeviceId,
+    prewarmId: 'warm-switch-00000001',
+    collection: (name) => database.collection(name),
+    now: () => now,
+  });
+  assert.equal(denied.cancelled, false);
+  const cancelled = await cancelPlaybackPrewarm({
+    userId: 'user-a',
+    requesterDeviceId,
+    deviceId: destinationDeviceId,
+    prewarmId: 'warm-switch-00000001',
+    collection: (name) => database.collection(name),
+    now: () => now,
+  });
+  assert.equal(cancelled.cancelled, true);
+  const stale = await updatePlaybackPrewarmStatus({
+    userId: 'user-a',
+    deviceId: destinationDeviceId,
+    prewarmId: 'warm-switch-00000001',
+    status: 'ready',
+    collection: (name) => database.collection(name),
+    now: () => now,
+  });
+  assert.equal(stale.stale, true);
+});
+
+test('Connect prewarm cancellation releases a recently ready destination', async () => {
+  const database = new MemoryDatabase();
+  const now = new Date('2026-11-20T12:00:00.000Z');
+  const requesterDeviceId = '0123456789abcdef0123456789abcdef';
+  const destinationDeviceId = 'abcdef0123456789abcdef0123456789';
+  database.collection('playback_commands').documents.push({
+    _id: new ObjectId(),
+    userId: 'user-a',
+    deviceId: destinationDeviceId,
+    action: 'prewarm',
+    payload: {
+      prewarmId: 'warm-switch-00000001',
+      requesterDeviceId,
+      prewarmStatus: 'ready',
+    },
+    status: 'ok',
+    acknowledgedAt: now,
+  });
+
+  const cancelled = await cancelPlaybackPrewarm({
+    userId: 'user-a',
+    requesterDeviceId,
+    deviceId: destinationDeviceId,
+    prewarmId: 'warm-switch-00000001',
+    collection: (name) => database.collection(name),
+    now: () => now,
+  });
+
+  assert.equal(cancelled.cancelled, true);
+  assert.equal(
+    database.collection('playback_commands').documents[0].payload.prewarmStatus,
+    'cancelled',
+  );
+  const stale = await updatePlaybackPrewarmStatus({
+    userId: 'user-a',
+    deviceId: destinationDeviceId,
+    prewarmId: 'warm-switch-00000001',
+    status: 'ready',
+    collection: (name) => database.collection(name),
+    now: () => now,
+  });
+  assert.equal(stale.stale, true);
+});
+
+test('Connect handoff commit uses a recent source position and server bounded schedule', async () => {
+  const database = new MemoryDatabase();
+  const now = new Date('2026-11-20T12:00:00.000Z');
+  const requesterDeviceId = '0123456789abcdef0123456789abcdef';
+  const destinationDeviceId = 'abcdef0123456789abcdef0123456789';
+  database.collection('playback_sessions').documents.push({
+    _id: 'user-a',
+    activeDeviceId: requesterDeviceId,
+    trackIds: ['track-a', 'track-b'],
+    index: 0,
+    positionMs: 1_000,
+    durationMs: 180_000,
+    volume: 1,
+    playing: true,
+    shuffle: false,
+    repeat: 'none',
+    queueRevision: 7,
+    revision: 11,
+    updatedAt: new Date(now.getTime() - 2_000),
+  });
+  database.collection('playback_devices').documents.push({
+    userId: 'user-a',
+    deviceId: destinationDeviceId,
+    lastSeenAt: now,
+    capabilities: { playback: true },
+  });
+  const result = await createPlaybackHandoff({
+    userId: 'user-a',
+    requesterDeviceId,
+    deviceId: destinationDeviceId,
+    positionMs: 2_000,
+    positionTimestamp: new Date(now.getTime() - 500).toISOString(),
+    playbackRate: 1.5,
+    queueRevision: 7,
+    scheduledStartAt: new Date(now.getTime() + 600).toISOString(),
+    collection: (name) => database.collection(name),
+    now: () => now,
+  });
+  assert.equal(result.status, 'pending');
+  const command = database.collection('playback_commands').documents[0];
+  assert.equal(command.payload.sourceDeviceId, requesterDeviceId);
+  assert.equal(command.payload.destinationDeviceId, destinationDeviceId);
+  assert.equal(command.payload.positionMs, 2_750);
+  assert.equal(command.payload.playbackRate, 1.5);
+  assert.equal(command.payload.queueRevision, 7);
+  assert.equal(command.payload.scheduledStartAt.getTime(), now.getTime() + 600);
+  assert.equal(command.payload.session.positionMs, 2_750);
+  assert.equal(command.deadlineAt.getTime(), now.getTime() + 60_000);
+});
+
+test('a non-owner device can request a handoff without overriding the owner checkpoint', async () => {
+  const database = new MemoryDatabase();
+  const now = new Date('2026-11-20T12:00:00.000Z');
+  const activeDeviceId = '0123456789abcdef0123456789abcdef';
+  const requesterDeviceId = 'fedcba9876543210fedcba9876543210';
+  const destinationDeviceId = 'abcdef0123456789abcdef0123456789';
+  database.collection('playback_sessions').documents.push({
+    _id: 'user-a',
+    activeDeviceId,
+    trackIds: ['track-a', 'track-b'],
+    index: 0,
+    positionMs: 42_000,
+    durationMs: 180_000,
+    volume: 1,
+    playing: true,
+    shuffle: false,
+    repeat: 'none',
+    queueRevision: 7,
+    revision: 11,
+    updatedAt: new Date(now.getTime() - 2_000),
+  });
+  database.collection('playback_devices').documents.push(
+    {
+      userId: 'user-a',
+      deviceId: activeDeviceId,
+      lastSeenAt: now,
+      capabilities: { playback: true },
+    },
+    {
+      userId: 'user-a',
+      deviceId: destinationDeviceId,
+      lastSeenAt: now,
+      capabilities: { playback: true },
+    },
+  );
+
+  await assert.rejects(
+    createPlaybackHandoff({
+      userId: 'user-a',
+      requesterDeviceId: activeDeviceId,
+      deviceId: destinationDeviceId,
+      queueRevision: 6,
+      collection: (name) => database.collection(name),
+      now: () => now,
+    }),
+    { code: 'playback_changed' },
+  );
+
+  const result = await createPlaybackHandoff({
+    userId: 'user-a',
+    requesterDeviceId,
+    deviceId: destinationDeviceId,
+    positionMs: 2_000,
+    positionTimestamp: new Date(now.getTime() - 500).toISOString(),
+    playbackRate: 1.5,
+    queueRevision: 6,
+    collection: (name) => database.collection(name),
+    now: () => now,
+  });
+
+  assert.equal(result.status, 'pending');
+  const command = database.collection('playback_commands').documents[0];
+  assert.equal(command.payload.sourceDeviceId, activeDeviceId);
+  assert.equal(command.payload.destinationDeviceId, destinationDeviceId);
+  assert.equal(command.payload.positionMs, 44_000);
+  assert.equal(command.payload.playbackRate, 1);
+  assert.equal(command.payload.session.queueRevision, 7);
+  assert.equal(command.payload.session.playing, true);
+  assert.equal(
+    (
+      await database.collection('playback_sessions').findOne({ _id: 'user-a' })
+    ).activeDeviceId,
+    activeDeviceId,
+  );
+});
+
 test('playback polling releases an expired group claim before personal playback claims the device', async () => {
   const database = new MemoryDatabase();
   const time = new Date('2026-11-18T00:00:00.000Z');
@@ -147,10 +461,11 @@ test('playback polling releases an expired group claim before personal playback 
   assert.equal(device.groupSessionExpiresAt, undefined);
 });
 
-test('a live device can claim playback when the paused owner has gone offline', async () => {
+test('the first online device prepares failover without a local playback snapshot', async () => {
   const database = new MemoryDatabase();
   const time = new Date('2026-11-18T00:00:00.000Z');
   const localDeviceId = '0123456789abcdef0123456789abcdef';
+  const secondDeviceId = 'fedcba9876543210fedcba9876543210';
   const offlineDeviceId = 'abcdef0123456789abcdef0123456789';
   await database.collection('playback_devices').insertOne({
     userId: 'user-a',
@@ -167,7 +482,7 @@ test('a live device can claim playback when the paused owner has gone offline', 
     index: 0,
     positionMs: 21_000,
     durationMs: 180_000,
-    playing: false,
+    playing: true,
     shuffle: false,
     repeat: 'none',
     title: 'Stale track',
@@ -186,31 +501,62 @@ test('a live device can claim playback when the paused owner has gone offline', 
       deviceId: localDeviceId,
       name: 'Android device',
       platform: 'android',
-      claim: true,
-      snapshot: {
-        trackIds: ['actual-track'],
-        index: 0,
-        positionMs: 4_000,
-        durationMs: 200_000,
-        volume: 1,
-        playing: true,
-        shuffle: false,
-        repeat: 'none',
-        title: 'Actual track',
-        artist: 'Current artist',
-      },
     },
   });
 
-  assert.equal(result.session.activeDeviceId, localDeviceId);
-  assert.deepEqual(result.session.trackIds, ['actual-track']);
-  assert.equal(result.session.title, 'Actual track');
-  assert.equal(result.session.playing, true);
+  assert.equal(result.session.activeDeviceId, offlineDeviceId);
+  assert.deepEqual(result.session.trackIds, ['stale-track']);
+  assert.equal(result.session.title, 'Stale track');
+  assert.equal(result.session.playing, false);
+  assert.equal(result.commands.length, 1);
+  assert.equal(result.commands[0].action, 'handoff');
+  assert.deepEqual(result.commands[0].payload.session.trackIds, ['stale-track']);
+  assert.equal(result.commands[0].payload.session.playing, true);
   assert.equal(
     (
       await database.collection('playback_sessions').findOne({ _id: 'user-a' })
     ).resumeOnFailover,
-    false,
+    true,
+  );
+
+  const secondResult = await pollPlayback({
+    userId: 'user-a',
+    collection: (name) => database.collection(name),
+    now: () => time,
+    body: {
+      deviceId: secondDeviceId,
+      name: 'Second Android device',
+      platform: 'android',
+    },
+  });
+  assert.equal(secondResult.commands.length, 0);
+  assert.equal(
+    (
+      await database.collection('playback_sessions').findOne({ _id: 'user-a' })
+    ).failoverCandidateDeviceId,
+    localDeviceId,
+  );
+
+  const acknowledgement = await acknowledgePlaybackCommand({
+    userId: 'user-a',
+    commandId: result.commands[0].id,
+    deviceId: localDeviceId,
+    status: 'ok',
+    collection: (name) => database.collection(name),
+    now: () => time,
+  });
+  assert.equal(acknowledgement.transferStatus, 'completed');
+  const resumedSession = await database
+    .collection('playback_sessions')
+    .findOne({ _id: 'user-a' });
+  assert.equal(resumedSession.activeDeviceId, localDeviceId);
+  assert.equal(resumedSession.playing, true);
+  assert.deepEqual(resumedSession.trackIds, ['stale-track']);
+  assert.equal(resumedSession.resumeOnFailover, false);
+  assert.equal(resumedSession.failoverCandidateDeviceId, null);
+  assert.equal(
+    resumedSession.failoverCandidateExpiresAt,
+    null,
   );
 });
 
@@ -601,6 +947,32 @@ test('playback polling, handoff, commands, and device visibility are account-sco
     );
     assert.ok(handoffCommand);
     assert.deepEqual(handoffCommand.payload.session.trackIds, snapshot.trackIds);
+    // The source can briefly report another queue position while the target
+    // prebuffers, then return to the exact track the transfer captured. A
+    // monotonic queue revision alone must not reject this still-valid handoff.
+    await request('/playback/poll', {
+      method: 'POST',
+      body: {
+        deviceId: deviceA,
+        name: 'Android â€¢ A',
+        platform: 'android',
+        snapshot: { ...changedSnapshot, index: 0 },
+      },
+    });
+    const returnedToTransferTrack = await request('/playback/poll', {
+      method: 'POST',
+      body: {
+        deviceId: deviceA,
+        name: 'Android â€¢ A',
+        platform: 'android',
+        snapshot: changedSnapshot,
+      },
+    });
+    assert.equal(returnedToTransferTrack.body.session.index, 1);
+    assert.ok(
+      returnedToTransferTrack.body.session.queueRevision >
+        handoffCommand.payload.session.queueRevision,
+    );
     const handoffAck = await request(`/playback/commands/${handoffCommand.id}/ack`, {
       method: 'POST',
       body: { deviceId: deviceB, status: 'ok' },
@@ -672,11 +1044,26 @@ test('playback polling, handoff, commands, and device visibility are account-sco
       ['seek', { positionMs: 9000 }],
     ]);
 
+    const acknowledgedSnapshot = {
+      ...snapshot,
+      index: targetPoll.body.session.index,
+      positionMs: 9000,
+      playbackEpoch: targetPoll.body.session.playbackEpoch,
+    };
     const ack = await request(`/playback/commands/${targetPoll.body.commands[0].id}/ack`, {
       method: 'POST',
-      body: { deviceId: deviceB, status: 'ok' },
+      body: {
+        deviceId: deviceB,
+        status: 'ok',
+        snapshot: acknowledgedSnapshot,
+      },
     });
     assert.equal(ack.response.status, 200);
+    const acknowledgedState = (await request('/playback/state')).body.session;
+    assert.equal(acknowledgedState.positionMs, 9000);
+    assert.equal(acknowledgedState.index, targetPoll.body.session.index);
+    assert.equal(acknowledgedState.playing, true);
+    assert.ok(acknowledgedState.revision > targetPoll.body.session.revision);
     const duplicateAck = await request(
       `/playback/commands/${targetPoll.body.commands[0].id}/ack`,
       {
@@ -765,22 +1152,14 @@ test('playback polling, handoff, commands, and device visibility are account-sco
       true,
     );
 
-    await request('/playback/poll', {
-      method: 'POST',
-      body: { deviceId: deviceA, name: 'Android • A', platform: 'android' },
-    });
-    const failover = await request('/playback/handoff', {
-      method: 'POST',
-      body: { deviceId: deviceA },
-    });
     const failoverCommandPoll = await request('/playback/poll', {
       method: 'POST',
       body: { deviceId: deviceA, name: 'Android • A', platform: 'android' },
     });
     const failoverCommand = failoverCommandPoll.body.commands.find(
-      ({ action, payload }) =>
-        action === 'handoff' && payload.transferId === failover.body.transferId,
+      ({ action }) => action === 'handoff',
     );
+    assert.ok(failoverCommand);
     assert.equal(failoverCommand.payload.session.playing, true);
     const failoverAck = await request(
       `/playback/commands/${failoverCommand.id}/ack`,

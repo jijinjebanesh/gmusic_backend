@@ -7,6 +7,7 @@ import { col, mongoEnabled } from './db.js';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const tokenFile = process.env.GDRIVE_TOKEN_PATH || path.resolve(here, '../data/token.json');
 const scopes = ['https://www.googleapis.com/auth/drive.readonly'];
+export const MAX_COVER_ART_SCAN_BYTES = 8 * 1024 * 1024;
 
 // Precedence: inline JSON (GDRIVE_CREDENTIALS) -> client id/secret env
 // parts -> the credentials.json file next to this repo. Serverless platforms
@@ -237,21 +238,15 @@ export async function createDriveSession({
       };
     },
     // Drive returns no thumbnailLink for audio files, so artwork comes from the
-    // tags embedded in the file itself. Only the first megabyte is fetched:
-    // ID3v2 and FLAC metadata blocks live at the head of the file.
+    // tags embedded in the file itself. The scan is bounded but large enough
+    // for common multi-megabyte FLAC picture blocks.
     async coverArt(id) {
       assertTokenPersistence();
       const response = await drive.files.get({ fileId: id, alt: 'media' }, {
         responseType: 'stream',
-        headers: { Range: 'bytes=0-1048575' },
+        headers: { Range: `bytes=0-${MAX_COVER_ART_SCAN_BYTES - 1}` },
       });
-      const chunks = [];
-      for await (const chunk of response.data) {
-        chunks.push(chunk);
-        const total = chunks.reduce((n, c) => n + c.length, 0);
-        if (total >= 1024 * 1024) break;
-      }
-      return extractCoverArt(Buffer.concat(chunks));
+      return extractCoverArtFromStream(response.data);
     },
   };
 }
@@ -259,6 +254,21 @@ export async function createDriveSession({
 // --- embedded artwork extraction (ID3v2 / FLAC) ------------------------------
 
 const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'];
+
+export async function extractCoverArtFromStream(stream) {
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of stream) {
+    const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const remaining = MAX_COVER_ART_SCAN_BYTES - total;
+    if (remaining <= 0) break;
+    const boundedChunk = data.length > remaining ? data.subarray(0, remaining) : data;
+    chunks.push(boundedChunk);
+    total += boundedChunk.length;
+    if (total >= MAX_COVER_ART_SCAN_BYTES) break;
+  }
+  return extractCoverArt(Buffer.concat(chunks, total));
+}
 
 function extractCoverArt(buf) {
   if (buf.length > 3 && buf.toString('latin1', 0, 3) === 'ID3') {

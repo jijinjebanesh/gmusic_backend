@@ -6,8 +6,10 @@ import { publishPlaybackEvent } from './playback_event_bus.js';
 
 const DEVICE_ONLINE_MS = 12_000;
 const COMMAND_TTL_MS = 60_000;
+const PREWARM_TTL_MS = 60_000;
 const COMMAND_RETENTION_MS = 24 * 60 * 60 * 1000;
 const TRANSFER_TTL_MS = 30_000;
+const HANDOFF_TTL_MS = 60_000;
 const MAX_QUEUE_SIZE = 500;
 const MAX_POSITION_MS = 86_400_000;
 const PLATFORM_VALUES = new Set([
@@ -36,6 +38,16 @@ const COMMANDS = new Set([
   'stop',
   'volume',
 ]);
+
+function handoffPlaybackChanged(transfer, session) {
+  if (!Array.isArray(transfer.trackIds)) {
+    // Preserve compatibility with handoffs created before queue identity was
+    // stored alongside the transfer.
+    return (session.queueRevision || 0) !== transfer.queueRevision;
+  }
+  return !isDeepStrictEqual(session.trackIds || [], transfer.trackIds) ||
+    (session.index || 0) !== (transfer.index || 0);
+}
 
 function apiError(status, code) {
   const error = new Error(code);
@@ -259,7 +271,7 @@ async function ensureSession(sessions, userId, now) {
 async function updateSession(
   sessions,
   userId,
-  fields,
+  fieldsOrMutator,
   {
     queueChanged = false,
     advancePlaybackEpoch = false,
@@ -270,12 +282,20 @@ async function updateSession(
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const current = await sessions.findOne({ _id: userId });
     if (!current) throw apiError(409, 'playback_session_missing');
+    const currentRevision = current.revision || 0;
+    const currentPlaybackEpoch = current.playbackEpoch || 0;
+    const currentQueueRevision = current.queueRevision || 0;
     if (
       expectedRevision !== null &&
-      (current.revision || 0) !== expectedRevision
+      currentRevision !== expectedRevision
     ) {
       throw apiError(409, 'playback_conflict');
     }
+    // Re-compute fields from current state on each retry when a mutator
+    // function is provided, so retries never apply stale caller-computed data.
+    const fields = typeof fieldsOrMutator === 'function'
+      ? fieldsOrMutator(current)
+      : fieldsOrMutator;
     const epochChanged =
       advancePlaybackEpoch ||
       (Object.hasOwn(fields, 'activeDeviceId') &&
@@ -294,7 +314,7 @@ async function updateSession(
       },
     };
     const result = await sessions.updateOne(
-      { _id: userId, revision: current.revision || 0 },
+      { _id: userId, revision: currentRevision },
       update,
     );
     if (result.matchedCount) {
@@ -302,10 +322,9 @@ async function updateSession(
         ...current,
         ...fields,
         updatedAt,
-        revision: (current.revision || 0) + 1,
-        playbackEpoch:
-          (current.playbackEpoch || 0) + (epochChanged ? 1 : 0),
-        queueRevision: (current.queueRevision || 0) + (queueChanged ? 1 : 0),
+        revision: currentRevision + 1,
+        playbackEpoch: currentPlaybackEpoch + (epochChanged ? 1 : 0),
+        queueRevision: currentQueueRevision + (queueChanged ? 1 : 0),
       };
     }
   }
@@ -326,15 +345,93 @@ async function pauseExpiredPlayback(collection, userId, session, time) {
   ) {
     return session;
   }
-  return updateSession(
-    collection('playback_sessions'),
-    userId,
-    {
-      ...(session.playing ? { playing: false } : {}),
-      resumeOnFailover: true,
-    },
-    { updatedAt: time },
+  try {
+    return await updateSession(
+      collection('playback_sessions'),
+      userId,
+      {
+        ...(session.playing ? { playing: false } : {}),
+        resumeOnFailover: true,
+      },
+      {
+        updatedAt: time,
+        expectedRevision: session.revision || 0,
+      },
+    );
+  } catch (error) {
+    if (error.code !== 'playback_conflict') throw error;
+    return collection('playback_sessions').findOne({ _id: userId });
+  }
+}
+
+async function reserveFailoverCandidate({
+  collection,
+  userId,
+  session,
+  deviceId,
+  time,
+}) {
+  const reservationExpiresAt = new Date(
+    time.getTime() + TRANSFER_TTL_MS,
   );
+  const currentExpiry = new Date(
+    session.failoverCandidateExpiresAt || 0,
+  ).getTime();
+  if (
+    session.failoverCandidateDeviceId &&
+    currentExpiry > time.getTime()
+  ) {
+    return session;
+  }
+  try {
+    return await updateSession(
+      collection('playback_sessions'),
+      userId,
+      {
+        failoverCandidateDeviceId: deviceId,
+        failoverCandidateExpiresAt: reservationExpiresAt,
+      },
+      {
+        updatedAt: time,
+        expectedRevision: session.revision || 0,
+      },
+    );
+  } catch (error) {
+    if (error.code !== 'playback_conflict') throw error;
+    return collection('playback_sessions').findOne({ _id: userId });
+  }
+}
+
+async function releaseFailoverCandidate({
+  collection,
+  userId,
+  deviceId,
+  time,
+}) {
+  const sessions = collection('playback_sessions');
+  const session = await sessions.findOne({ _id: userId });
+  if (
+    session?.resumeOnFailover !== true ||
+    session.failoverCandidateDeviceId !== deviceId
+  ) {
+    return;
+  }
+  try {
+    await updateSession(
+      sessions,
+      userId,
+      {
+        failoverCandidateDeviceId: null,
+        failoverCandidateExpiresAt: null,
+      },
+      {
+        updatedAt: time,
+        expectedRevision: session.revision || 0,
+      },
+    );
+  } catch (error) {
+    if (error.code !== 'playback_conflict') throw error;
+  }
 }
 
 function commandPayload(action, payload = {}) {
@@ -440,26 +537,81 @@ export async function pollPlayback({
   let session = await sessions.findOne({ _id: userId });
   const initialRevision = session?.revision || 0;
   session = await pauseExpiredPlayback(collection, userId, session, time);
-  if (!existingDevice?.groupSessionId && claim) {
-    if (!snapshot?.trackIds.length || !snapshot.playing) {
+  if (
+    !existingDevice?.groupSessionId &&
+    session?.resumeOnFailover === true &&
+    session.trackIds?.length &&
+    capabilities.playback !== false
+  ) {
+    session = await reserveFailoverCandidate({
+      collection,
+      userId,
+      session,
+      deviceId,
+      time,
+    });
+    const reservationExpiresAt = new Date(
+      session?.failoverCandidateExpiresAt || 0,
+    ).getTime();
+    if (
+      session?.failoverCandidateDeviceId === deviceId &&
+      reservationExpiresAt > time.getTime()
+    ) {
+      const pendingTransfer = await collection('playback_transfers').findOne({
+        userId,
+        sourceDeviceId: session.activeDeviceId,
+        targetDeviceId: deviceId,
+        status: 'pending',
+        expiresAt: { $gt: time },
+      });
+      if (!pendingTransfer) {
+        try {
+          await createPlaybackHandoff({
+            userId,
+            deviceId,
+            collection,
+            now,
+          });
+        } catch (error) {
+          await releaseFailoverCandidate({
+            collection,
+            userId,
+            deviceId,
+            time: now(),
+          });
+          throw error;
+        }
+      }
+    }
+  } else if (!existingDevice?.groupSessionId && claim) {
+    if (!snapshot?.trackIds.length) {
       throw apiError(400, 'invalid_playback_claim');
     }
-    const anotherDeviceOwnsPlayback =
-      session?.activeDeviceId != null &&
-      session.activeDeviceId !== deviceId &&
-      session.resumeOnFailover !== true;
+    await ensureSession(sessions, userId, time);
+    const claimSession = await sessions.findOne({ _id: userId });
+    const anotherDeviceOwnsPlayback = claimSession?.activeDeviceId != null &&
+      claimSession.activeDeviceId !== deviceId &&
+      claimSession.resumeOnFailover !== true;
     if (!anotherDeviceOwnsPlayback) {
-      await ensureSession(sessions, userId, time);
-      session = await updateSession(
-        sessions,
-        userId,
-        { activeDeviceId: deviceId, ...sessionFields(snapshot) },
-        {
-          queueChanged: true,
-          advancePlaybackEpoch: true,
-          updatedAt: time,
-        },
-      );
+      try {
+        const claimFields = sessionFields(snapshot);
+        claimFields.failoverCandidateDeviceId = null;
+        claimFields.failoverCandidateExpiresAt = null;
+        session = await updateSession(
+          sessions,
+          userId,
+          { activeDeviceId: deviceId, ...claimFields },
+          {
+            queueChanged: true,
+            advancePlaybackEpoch: true,
+            updatedAt: time,
+            expectedRevision: claimSession?.revision || 0,
+          },
+        );
+      } catch (error) {
+        if (error.code !== 'playback_conflict') throw error;
+        session = await sessions.findOne({ _id: userId });
+      }
     }
   } else if (
     !existingDevice?.groupSessionId &&
@@ -790,9 +942,198 @@ export async function createPlaybackCommand({
   };
 }
 
+export async function createPlaybackPrewarm({
+  userId,
+  requesterDeviceId,
+  deviceId,
+  prewarmId,
+  collection = col,
+  now = () => new Date(),
+}) {
+  if (!/^[A-Za-z0-9_-]{16,128}$/.test(String(prewarmId || ''))) {
+    throw apiError(400, 'invalid_prewarm');
+  }
+  const time = now();
+  const [session, target] = await Promise.all([
+    collection('playback_sessions').findOne({ _id: userId }),
+    collection('playback_devices').findOne({
+      userId,
+      deviceId,
+      lastSeenAt: { $gte: new Date(time.getTime() - DEVICE_ONLINE_MS) },
+    }),
+  ]);
+  if (!session?.activeDeviceId || session.activeDeviceId !== requesterDeviceId ||
+      !session.trackIds?.length) throw apiError(409, 'not_active_device');
+  if (!target) throw apiError(409, 'device_offline');
+  if (deviceInGroupSession(target, time)) throw apiError(409, 'device_in_group_session');
+  if (target.capabilities?.playback === false) throw apiError(409, 'device_restricted');
+  if (deviceId === requesterDeviceId) throw apiError(400, 'invalid_device');
+  const expiresAt = new Date(time.getTime() + PREWARM_TTL_MS);
+  const commands = collection('playback_commands');
+  const existing = await commands.findOne({ userId, deviceId, action: 'prewarm', 'payload.prewarmId': prewarmId });
+  if (existing) return { prewarmId, commandId: String(existing._id), status: existing.status };
+  const inserted = await commands.insertOne({
+    userId, deviceId, action: 'prewarm',
+    payload: {
+      prewarmId,
+      requesterDeviceId,
+      queueRevision: session.queueRevision || 0,
+      trackId: session.trackIds[session.index],
+      positionMs: session.positionMs || 0,
+      positionTimestamp: session.updatedAt || time,
+      playbackRate: 1,
+      session: publicSession(session, time),
+    },
+    status: 'pending', createdAt: time, deadlineAt: expiresAt,
+    expiresAt: new Date(expiresAt.getTime() + COMMAND_RETENTION_MS),
+  });
+  publishPlaybackEvent(userId, { deviceId });
+  return { prewarmId, commandId: String(inserted.insertedId), status: 'pending' };
+}
+
+export async function updatePlaybackPrewarmStatus({
+  userId,
+  deviceId,
+  prewarmId,
+  status,
+  error = null,
+  collection = col,
+  now = () => new Date(),
+}) {
+  if (!/^[A-Za-z0-9_-]{16,128}$/.test(String(prewarmId || '')) ||
+      !['preparing', 'ready', 'failed'].includes(status)) {
+    throw apiError(400, 'invalid_prewarm_status');
+  }
+  const time = now();
+  const commands = collection('playback_commands');
+  const command = await commands.findOne({
+    userId,
+    deviceId,
+    action: 'prewarm',
+    status: 'pending',
+    'payload.prewarmId': prewarmId,
+    ...commandDeadlineFilter('$gt', time),
+  });
+  if (!command) {
+    const expired = await commands.findOne({
+      userId,
+      deviceId,
+      action: 'prewarm',
+      status: 'pending',
+      'payload.prewarmId': prewarmId,
+    });
+    if (expired && commandDeadline(expired) <= time) {
+      await commands.updateOne(
+        { _id: expired._id, userId, deviceId, status: 'pending' },
+        {
+          $set: {
+            status: 'failed',
+            error: 'command_timeout',
+            acknowledgedAt: time,
+          },
+        },
+      );
+    }
+    return { stale: true, prewarmId, deviceId };
+  }
+  const requesterDeviceId = command.payload.requesterDeviceId;
+  await commands.updateOne(
+    { _id: command._id, userId, deviceId, status: 'pending' },
+    {
+      $set: {
+        'payload.prewarmStatus': status,
+        'payload.prewarmUpdatedAt': time,
+        ...(status === 'failed'
+          ? { 'payload.prewarmError': String(error || 'prewarm_failed').slice(0, 120) }
+          : {}),
+      },
+    },
+  );
+  return {
+    stale: false,
+    prewarmId,
+    deviceId,
+    requesterDeviceId,
+    status,
+    error: status === 'failed' ? String(error || 'prewarm_failed').slice(0, 120) : null,
+  };
+}
+
+export async function cancelPlaybackPrewarm({
+  userId,
+  requesterDeviceId,
+  deviceId,
+  prewarmId,
+  collection = col,
+  now = () => new Date(),
+}) {
+  if (!/^[A-Za-z0-9_-]{16,128}$/.test(String(prewarmId || ''))) {
+    throw apiError(400, 'invalid_prewarm');
+  }
+  const time = now();
+  const commands = collection('playback_commands');
+  let command = await commands.findOne({
+    userId,
+    deviceId,
+    action: 'prewarm',
+    status: 'pending',
+    'payload.prewarmId': prewarmId,
+    'payload.requesterDeviceId': requesterDeviceId,
+    ...commandDeadlineFilter('$gt', time),
+  });
+  if (!command) {
+    command = await commands.findOne({
+      userId,
+      deviceId,
+      action: 'prewarm',
+      status: 'ok',
+      'payload.prewarmId': prewarmId,
+      'payload.requesterDeviceId': requesterDeviceId,
+      'payload.prewarmStatus': 'ready',
+      acknowledgedAt: {
+        $gte: new Date(time.getTime() - PREWARM_TTL_MS),
+      },
+    });
+  }
+  if (!command) return { cancelled: false, stale: true, prewarmId, deviceId };
+  const result = await commands.updateOne(
+    {
+      _id: command._id,
+      userId,
+      deviceId,
+      status: command.status,
+      'payload.prewarmId': prewarmId,
+      'payload.requesterDeviceId': requesterDeviceId,
+    },
+    {
+      $set: {
+        status: 'failed',
+        error: 'prewarm_cancelled',
+        acknowledgedAt: time,
+        'payload.prewarmStatus': 'cancelled',
+        'payload.prewarmUpdatedAt': time,
+      },
+    },
+  );
+  return {
+    cancelled: result.matchedCount === 1,
+    stale: result.matchedCount !== 1,
+    prewarmId,
+    deviceId,
+    requesterDeviceId,
+  };
+}
+
 export async function createPlaybackHandoff({
   userId,
   deviceId,
+  requesterDeviceId = null,
+  prewarmId = null,
+  positionMs: requestedPositionMs = null,
+  positionTimestamp = null,
+  playbackRate: requestedPlaybackRate = 1,
+  queueRevision = null,
+  scheduledStartAt = null,
   collection = col,
   now = () => new Date(),
 }) {
@@ -816,6 +1157,56 @@ export async function createPlaybackHandoff({
   if (!session?.activeDeviceId || !session.trackIds?.length) {
     throw apiError(409, 'no_active_playback');
   }
+  let activeSession = session;
+  if (activeSession.resumeOnFailover === true) {
+    const candidateId = activeSession.failoverCandidateDeviceId;
+    const candidateExpiryMs = new Date(
+      activeSession.failoverCandidateExpiresAt || 0,
+    ).getTime();
+    const otherActiveReservation =
+      candidateId &&
+      candidateId !== deviceId &&
+      candidateId !== requesterDeviceId &&
+      candidateExpiryMs > time.getTime();
+    if (otherActiveReservation) {
+      const candidateOnline = await collection('playback_devices').findOne({
+        userId,
+        deviceId: candidateId,
+        lastSeenAt: { $gte: new Date(time.getTime() - DEVICE_ONLINE_MS) },
+      });
+      if (candidateOnline) {
+        throw apiError(409, 'failover_claim_lost');
+      }
+    }
+    try {
+      activeSession = await updateSession(
+        collection('playback_sessions'),
+        userId,
+        {
+          failoverCandidateDeviceId: deviceId,
+          failoverCandidateExpiresAt: new Date(
+            time.getTime() + TRANSFER_TTL_MS,
+          ),
+        },
+        {
+          updatedAt: time,
+          expectedRevision: activeSession.revision || 0,
+        },
+      );
+    } catch (error) {
+      if (error.code !== 'playback_conflict') throw error;
+      throw apiError(409, 'failover_claim_lost');
+    }
+  }
+  const requesterIsActiveOwner = requesterDeviceId === session.activeDeviceId;
+  const currentQueueRevision = session.queueRevision || 0;
+  if (
+    requesterIsActiveOwner &&
+    queueRevision !== null &&
+    queueRevision !== currentQueueRevision
+  ) {
+    throw apiError(409, 'playback_changed');
+  }
   if (session.activeDeviceId === deviceId) {
     return {
       transferId: null,
@@ -823,16 +1214,94 @@ export async function createPlaybackHandoff({
       session: publicSession(session, time),
     };
   }
+  let acceptedPrewarmId = null;
+  if (typeof prewarmId === 'string' && /^[A-Za-z0-9_-]{16,128}$/.test(prewarmId)) {
+    const prepared = await collection('playback_commands').findOne({
+      userId,
+      deviceId,
+      action: 'prewarm',
+      'payload.prewarmId': prewarmId,
+      'payload.queueRevision': session.queueRevision || 0,
+      $or: [
+        {
+          status: 'ok',
+          acknowledgedAt: {
+            $gte: new Date(time.getTime() - PREWARM_TTL_MS),
+          },
+        },
+        { status: 'pending', 'payload.prewarmStatus': 'ready' },
+      ],
+    });
+    if (prepared &&
+        prepared.payload.session?.trackIds?.[prepared.payload.session.index] ===
+          session.trackIds[session.index]) {
+      acceptedPrewarmId = prewarmId;
+    }
+  }
   const transferId = new ObjectId();
-  const expiresAt = new Date(time.getTime() + TRANSFER_TTL_MS);
+  const expiresAt = new Date(time.getTime() + HANDOFF_TTL_MS);
   const resumePlayback =
     session.playing === true || session.resumeOnFailover === true;
+  const playbackRate = requesterIsActiveOwner &&
+      Number.isFinite(requestedPlaybackRate) &&
+      requestedPlaybackRate >= 0.25 && requestedPlaybackRate <= 4
+    ? requestedPlaybackRate
+    : 1;
+  const requestedTimestampMs = requesterIsActiveOwner
+    ? Date.parse(positionTimestamp || '')
+    : Number.NaN;
+  const sourceTimestampMs = Number.isFinite(requestedTimestampMs)
+    ? requestedTimestampMs
+    : new Date(session.updatedAt || time).getTime();
+  const sourceAgeMs = Math.min(
+    10_000,
+    Math.max(0, time.getTime() - sourceTimestampMs),
+  );
+  const canUseRequestPosition = Number.isInteger(requestedPositionMs) &&
+    requestedPositionMs >= 0 &&
+    queueRevision === currentQueueRevision &&
+    Number.isFinite(requestedTimestampMs) &&
+    time.getTime() - requestedTimestampMs <= 10_000;
+  const anchorPositionMs = canUseRequestPosition
+    ? requestedPositionMs
+    : Math.max(0, session.positionMs || 0);
+  const anchorAgeMs = canUseRequestPosition
+    ? sourceAgeMs
+    : Math.min(
+        10_000,
+        Math.max(0, time.getTime() - new Date(session.updatedAt || time).getTime()),
+      );
+  const commitPositionMs = Math.min(
+    session.durationMs || MAX_POSITION_MS,
+    Math.max(
+      0,
+      Math.round(
+        anchorPositionMs +
+          (session.playing ? anchorAgeMs * playbackRate : 0),
+      ),
+    ),
+  );
+  const requestedStartMs = Date.parse(scheduledStartAt || '');
+  const startTime = new Date(
+    Number.isFinite(requestedStartMs) &&
+        requestedStartMs >= time.getTime() - 100 &&
+        requestedStartMs <= time.getTime() + 2_000
+      ? requestedStartMs
+      : time.getTime() + 350,
+  );
   const transfer = {
     _id: transferId,
     userId,
     sourceDeviceId: session.activeDeviceId,
     targetDeviceId: deviceId,
-    queueRevision: session.queueRevision || 0,
+    queueRevision: currentQueueRevision,
+    positionMs: commitPositionMs,
+    positionTimestamp: time,
+    playbackRate,
+    scheduledStartAt: startTime,
+    prewarmId: acceptedPrewarmId,
+    trackIds: [...(session.trackIds || [])],
+    index: session.index || 0,
     resumePlayback,
     phase: 'preparing_target',
     status: 'pending',
@@ -846,7 +1315,20 @@ export async function createPlaybackHandoff({
     action: 'handoff',
     payload: {
       transferId: String(transferId),
-      session: publicSession({ ...session, playing: resumePlayback }),
+      sourceDeviceId: transfer.sourceDeviceId,
+      prewarmId: acceptedPrewarmId,
+      destinationDeviceId: deviceId,
+      positionMs: commitPositionMs,
+      positionTimestamp: time,
+      playbackRate,
+      queueRevision: currentQueueRevision,
+      scheduledStartAt: startTime,
+      session: publicSession({
+        ...session,
+        positionMs: commitPositionMs,
+        playing: resumePlayback,
+        updatedAt: time,
+      }, time),
     },
     status: 'pending',
     createdAt: time,
@@ -863,12 +1345,14 @@ export async function acknowledgePlaybackCommand({
   deviceId,
   status,
   error: commandError,
+  snapshot: rawSnapshot = null,
   collection = col,
   now = () => new Date(),
 }) {
   if (!ObjectId.isValid(commandId) || !['ok', 'failed'].includes(status)) {
     throw apiError(400, 'invalid_acknowledgment');
   }
+  const snapshot = status === 'ok' ? snapshotFrom(rawSnapshot) : null;
   const acknowledgedAt = now();
   const commands = collection('playback_commands');
   const commandFilter = {
@@ -886,20 +1370,34 @@ export async function acknowledgePlaybackCommand({
     (saved.error || null) === acknowledgmentError;
   const completedResult = async (saved) => {
     let transferStatus = null;
-    if (saved.action === 'handoff') {
+    let transferError = null;
+    const transferId = saved.action === 'handoff'
+      ? saved.payload.transferId
+      : saved.action === 'pause'
+        ? saved.payload.handoffTransferId
+        : null;
+    if (typeof transferId === 'string' && ObjectId.isValid(transferId)) {
       const transfer = await collection('playback_transfers').findOne({
-        _id: new ObjectId(saved.payload.transferId),
+        _id: new ObjectId(transferId),
         userId,
-        targetDeviceId: deviceId,
       });
       transferStatus = transfer?.status || null;
+      transferError = transfer?.error || null;
     }
     return {
       ok: true,
       commandId: String(saved._id),
       status: saved.status,
       error: saved.error || null,
+      transferId: transferId ? String(transferId) : null,
       transferStatus,
+      transferError,
+      ...(saved.action === 'prewarm'
+        ? {
+            prewarmId: saved.payload.prewarmId,
+            requesterDeviceId: saved.payload.requesterDeviceId,
+          }
+        : {}),
     };
   };
   if (command.status !== 'pending') {
@@ -953,7 +1451,44 @@ export async function acknowledgePlaybackCommand({
     throw apiError(409, 'command_not_pending');
   }
 
+  if (snapshot && command.action !== 'handoff') {
+    const currentSession = await collection('playback_sessions').findOne({
+      _id: userId,
+    });
+    if (
+      currentSession?.activeDeviceId === deviceId &&
+      (snapshot.playbackEpoch === undefined ||
+        snapshot.playbackEpoch === (currentSession.playbackEpoch || 0))
+    ) {
+      const fields = sessionFields(snapshot);
+      if (snapshot.trackIds.length === 0) {
+        fields.activeDeviceId = null;
+        fields.resumeOnFailover = false;
+      }
+      const queueChanged =
+        JSON.stringify(currentSession.trackIds || []) !==
+          JSON.stringify(snapshot.trackIds) ||
+        currentSession.index !== snapshot.index;
+      try {
+        await updateSession(
+          collection('playback_sessions'),
+          userId,
+          fields,
+          {
+            queueChanged,
+            advancePlaybackEpoch: snapshot.advancePlaybackEpoch,
+            updatedAt: acknowledgedAt,
+            expectedRevision: currentSession.revision || 0,
+          },
+        );
+      } catch (error) {
+        if (error.code !== 'playback_conflict') throw error;
+      }
+    }
+  }
+
   let transferStatus = null;
+  let transferError = null;
   if (command.action === 'handoff') {
     const transferId = new ObjectId(command.payload.transferId);
     const transfers = collection('playback_transfers');
@@ -964,7 +1499,7 @@ export async function acknowledgePlaybackCommand({
       status: 'pending',
     });
     if (transfer) {
-      let transferError = status === 'failed'
+      transferError = status === 'failed'
         ? String(commandError || 'target_rejected').slice(0, 120)
         : null;
       if (!transferError) {
@@ -986,11 +1521,17 @@ export async function acknowledgePlaybackCommand({
           },
         });
         if (!target) transferError = 'device_offline';
-        else if (!source && currentSession?.resumeOnFailover !== true) {
-          transferError = 'source_offline';
+        else if (
+          currentSession?.resumeOnFailover === true &&
+          currentSession.failoverCandidateDeviceId &&
+          currentSession.failoverCandidateDeviceId !== transfer.targetDeviceId &&
+          new Date(currentSession.failoverCandidateExpiresAt || 0).getTime() >
+            acknowledgedAt.getTime()
+        ) {
+          transferError = 'failover_claim_lost';
         } else if (
           currentSession?.activeDeviceId !== transfer.sourceDeviceId ||
-          (currentSession.queueRevision || 0) !== transfer.queueRevision
+          handoffPlaybackChanged(transfer, currentSession)
         ) {
           transferError = 'playback_changed';
         } else if (deviceInGroupSession(target, acknowledgedAt)) {
@@ -1003,10 +1544,16 @@ export async function acknowledgePlaybackCommand({
               {
                 activeDeviceId: transfer.targetDeviceId,
                 lastTransferId: String(transfer._id),
+                positionMs: transfer.positionMs,
                 playing: transfer.resumePlayback,
                 resumeOnFailover: false,
+                failoverCandidateDeviceId: null,
+                failoverCandidateExpiresAt: null,
               },
-              { updatedAt: now() },
+              {
+                updatedAt: now(),
+                expectedRevision: currentSession.revision || 0,
+              },
             );
             const claimedTarget = await collection('playback_devices')
               .findOne({ userId, deviceId });
@@ -1075,6 +1622,12 @@ export async function acknowledgePlaybackCommand({
             },
           },
         );
+        await releaseFailoverCandidate({
+          collection,
+          userId,
+          deviceId: transfer.targetDeviceId,
+          time: now(),
+        });
       }
     }
   } else if (
@@ -1092,7 +1645,7 @@ export async function acknowledgePlaybackCommand({
         phase: 'pausing_source',
       });
       if (transfer) {
-        let transferError = status === 'failed'
+        transferError = status === 'failed'
           ? String(commandError || 'source_pause_failed').slice(0, 120)
           : null;
         if (!transferError) {
@@ -1112,7 +1665,7 @@ export async function acknowledgePlaybackCommand({
           }
           else if (
             currentSession?.activeDeviceId !== transfer.sourceDeviceId ||
-            (currentSession.queueRevision || 0) !== transfer.queueRevision
+            handoffPlaybackChanged(transfer, currentSession)
           ) {
             transferError = 'playback_changed';
           } else {
@@ -1125,6 +1678,8 @@ export async function acknowledgePlaybackCommand({
                   lastTransferId: String(transfer._id),
                   playing: transfer.resumePlayback === true,
                   resumeOnFailover: false,
+                  failoverCandidateDeviceId: null,
+                  failoverCandidateExpiresAt: null,
                 },
                 { updatedAt: now() },
               );
@@ -1179,7 +1734,20 @@ export async function acknowledgePlaybackCommand({
     commandId: String(command._id),
     status,
     error: acknowledgmentError,
+    transferId: command.action === 'handoff'
+      ? String(command.payload.transferId)
+      : command.action === 'pause' &&
+          typeof command.payload.handoffTransferId === 'string'
+        ? command.payload.handoffTransferId
+        : null,
     transferStatus,
+    transferError,
+    ...(command.action === 'prewarm'
+      ? {
+          prewarmId: command.payload.prewarmId,
+          requesterDeviceId: command.payload.requesterDeviceId,
+        }
+      : {}),
   };
 }
 
@@ -1241,6 +1809,13 @@ export function createPlaybackRouter({
       const result = await createPlaybackHandoff({
         userId: req.user.id,
         deviceId: req.body?.deviceId,
+        requesterDeviceId: req.body?.requesterDeviceId,
+        prewarmId: req.body?.prewarmId,
+        positionMs: req.body?.positionMs,
+        positionTimestamp: req.body?.positionTimestamp,
+        playbackRate: req.body?.playbackRate,
+        queueRevision: req.body?.queueRevision,
+        scheduledStartAt: req.body?.scheduledStartAt,
         collection,
         now,
       });
@@ -1469,6 +2044,7 @@ export function createPlaybackRouter({
         deviceId: String(req.body?.deviceId || ''),
         status: req.body?.status,
         error: req.body?.error,
+        snapshot: req.body?.snapshot,
         collection,
         now,
       });

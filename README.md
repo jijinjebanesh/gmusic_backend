@@ -19,10 +19,10 @@ OAuth client secret anywhere but this service.
 | `POST /api/v1/auth/logout` · `GET /api/v1/auth/me` | session management |
 | `POST /api/v1/drive/oauth/start` · `GET /api/v1/drive/oauth/callback` | starts authorization for the common Drive by default; per-user PKCE is optional |
 | `POST /api/v1/drive/oauth/disconnect` | per-user mode: revoke and remove the current user's Google connection |
-| `GET /api/v1/tracks` | Compatible live Drive listing (paginated) with ticket URLs |
+| `GET /api/v1/tracks` | Compatible live Drive listing (paginated) with stream and browser-safe artwork ticket URLs |
 | `GET /api/v1/drive/status` · `GET /api/v1/drive/sync/status` | Drive authorization and persistent index status |
 | `POST /api/v1/drive/sync` | Runs one bounded full-index or incremental-change batch |
-| `GET /api/v1/catalog/tracks` · `GET /api/v1/catalog/tracks/:id` | Paginated indexed tracks with normalized tags and stream tickets |
+| `GET /api/v1/catalog/tracks` · `GET /api/v1/catalog/tracks/:id` | Paginated indexed tracks with normalized tags, stream URLs, and browser-safe artwork URLs |
 | `POST /api/v1/catalog/tracks/resolve` | Resolves up to 500 track IDs for playback handoff |
 | `GET /api/v1/catalog/tracks/:id/lyrics` | Embedded lyrics from indexed audio tags; returns `lyrics_not_found` when absent |
 | `GET /api/v1/playback/state` · `POST /api/v1/playback/poll` | Account-scoped device registry and versioned playback session |
@@ -80,16 +80,22 @@ device clocks. `/health` reports `playbackRealtime` and `playbackRedis`;
 the REST polling recovery path. The HTTP polling and command endpoints remain
 available for recovery and compatibility. Devices are considered offline
 after 12 seconds without a heartbeat. If the active device expires while
-playing, an online client can take over through the normal acknowledged
-handoff; playback resumes on the replacement device after it resolves and
-prepares the current track. Queue metadata can finish loading afterward.
+playing, the first playback-capable device to poll reserves failover and
+receives a normal acknowledged handoff. It becomes the owner only after it
+resolves and prepares the current track; playback then resumes from the saved
+session. Other devices wait while that reservation is active. Queue metadata
+can finish loading afterward.
 Commands expire for execution after 60 seconds; their status and
 idempotent acknowledgments are retained for 24 hours so retries do not become
 `command_not_found`. Commands can be cancelled if they time out.
 A transfer keeps the source authoritative until the online target resolves
-the queue and acknowledges preparation. A failed transfer leaves the source
+the queue and acknowledges preparation. Any signed-in device for the account
+can request a transfer; position and playback rate are anchored to the active
+source, not the requesting controller. A failed transfer leaves the source
 active. Queue revisions reject stale queue operations and prevent transfers
-from switching to a stale queue. Queues are capped at 500 tracks.
+from switching the active owner to a stale queue. A non-owner controller's
+revision is advisory; the transfer uses the current server session. Queues are
+capped at 500 tracks.
 
 Group Listening is separate from the account-level Connected Playback session.
 Rooms have their own shared queue and timeline, support up to 20 participants,
@@ -195,8 +201,12 @@ The `/health` response reports `authMode` and `database` so operators can verify
 the active mode without exposing connection details.
 
 The common Drive's initial index is resumable and processes a bounded metadata
-page per `POST /api/v1/drive/sync` call. Repeat the call until the status is
-`completed`; later calls apply incremental Drive changes. Audio tags are parsed
+page per `POST /api/v1/drive/sync` call. On an always-on Node deployment, the
+backend also starts an automatic sync after startup and continues every minute.
+Each run processes up to eight pages; later runs apply incremental Drive
+changes. In per-user mode, each connected Drive is synced. On Vercel, functions
+do not keep background timers alive, so configure a scheduled caller for
+`POST /api/v1/drive/sync` if automatic updates are needed. Audio tags are parsed
 from bounded stream heads; formats that keep metadata at the end of the file
 may have partial metadata.
 

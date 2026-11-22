@@ -9,6 +9,7 @@ import {
 import {
   groupRoom,
   playbackEventsAreShared,
+  publishAccountSyncInvite,
   publishGroupEvent,
   removeGroupDeviceFromRoom,
   removeGroupRoomSockets,
@@ -17,12 +18,34 @@ import {
 const MAX_MEMBERS = 20;
 const MAX_QUEUE_SIZE = 500;
 const MEMBER_ONLINE_MS = 12_000;
-const MEMBER_READY_MS = 6_000;
+const MEMBER_READY_MS = 15_000;
 const MIN_GROUP_BUFFER_MS = 2_000;
 const GROUP_PAUSE_LEAD_MS = 1_500;
 const ROOM_TTL_MS = 24 * 60 * 60_000;
 const MAX_POSITION_MS = 86_400_000;
 const MAX_POSITION_SAMPLE_AGE_MS = 15_000;
+const VALID_AUDIO_CHANNELS = new Set([
+  'full',
+  'left',
+  'right',
+  'center',
+  'subwoofer',
+  'surround_left',
+  'surround_right',
+]);
+const CHANNEL_LAYOUT_PRESETS = {
+  all_stereo: null,
+  stereo_split: ['left', 'right'],
+  surround_2_1: ['left', 'right', 'subwoofer'],
+  surround_5_1: [
+    'left',
+    'right',
+    'center',
+    'subwoofer',
+    'surround_left',
+    'surround_right',
+  ],
+};
 const HOST_ONLY_CONTROL_ACTIONS = new Set([
   'play',
   'pause',
@@ -34,6 +57,8 @@ const HOST_ONLY_CONTROL_ACTIONS = new Set([
   'queueRemove',
   'queueReorder',
   'queueClear',
+  'setChannel',
+  'setChannelLayout',
   'end',
 ]);
 
@@ -113,16 +138,20 @@ function publicRoom(room, time) {
     startAtServerTime: room.startAtServerTime || null,
     stateVersion: room.stateVersion || 0,
     queueRevision: room.queueRevision || 0,
+    channelLayout: room.channelLayout || 'all_stereo',
     serverTime: time.toISOString(),
     members: (room.members || []).map((member) => ({
       memberId: member.memberId,
+      deviceId: member.deviceId,
       name: member.name,
       platform: member.platform,
       isHost: member.memberId === room.hostMemberId,
+      canControlPlayback: member.userId === room.hostUserId,
       online: isOnline(member, time),
       ready: isReady(member, time),
       driftMs: Number.isFinite(member.driftMs) ? member.driftMs : null,
       latencyCompensationMs: member.latencyCompensationMs || 0,
+      audioChannel: member.audioChannel || 'full',
       joinedAt: member.joinedAt,
     })),
   };
@@ -219,13 +248,16 @@ async function verifyTrackAccess(req, ids, getAccessibleTracks) {
 }
 
 async function verifyRoomTrackAccess(req, room, ids, getAccessibleTracks) {
-  const userIds = new Set([
-    req.user.id,
-    ...(room.members || []).map((member) => member.userId),
-  ]);
-  for (const userId of userIds) {
+  const checked = new Set();
+  if (req.user?.id) {
+    checked.add(req.user.id);
+    await verifyTrackAccess(req, ids, getAccessibleTracks);
+  }
+  for (const member of room.members || []) {
+    if (!member.userId || checked.has(member.userId)) continue;
+    checked.add(member.userId);
     await verifyTrackAccess(
-      { ...req, user: { ...req.user, id: userId } },
+      { user: { id: member.userId } },
       ids,
       getAccessibleTracks,
     );
@@ -234,7 +266,11 @@ async function verifyRoomTrackAccess(req, room, ids, getAccessibleTracks) {
 
 function readyMembers(room, time) {
   const active = (room.members || []).filter((member) => isOnline(member, time));
-  return active.length > 0 && active.every((member) => isReady(member, time));
+  if (active.length === 0) return false;
+  // In a multi-member room, don't schedule until at least 2 members are online
+  // and ready.  A solo room (single member total) can still start immediately.
+  if ((room.members || []).length > 1 && active.length < 2) return false;
+  return active.every((member) => isReady(member, time));
 }
 
 function scheduleIfReady(room, time) {
@@ -630,7 +666,8 @@ export function createGroupListeningRouter({
         groups(), req.params.sessionId, req.user.id, deviceId, time,
       );
       if (HOST_ONLY_CONTROL_ACTIONS.has(action) &&
-          member.memberId !== room.hostMemberId) {
+          member.memberId !== room.hostMemberId &&
+          member.userId !== room.hostUserId) {
         throw apiError(403, 'group_host_required');
       }
       let addedTrackId = null;
@@ -661,7 +698,8 @@ export function createGroupListeningRouter({
       }
       const updated = await updateRoom(groups(), room._id, (current) => {
         if (HOST_ONLY_CONTROL_ACTIONS.has(action) &&
-            member.memberId !== current.hostMemberId) {
+            member.memberId !== current.hostMemberId &&
+            member.userId !== current.hostUserId) {
           throw apiError(403, 'group_host_required');
         }
         const currentPosition = roomPosition(current, time);
@@ -847,6 +885,54 @@ export function createGroupListeningRouter({
               queueRevision: (current.queueRevision || 0) + 1,
             };
           }
+          case 'setChannel': {
+            const targetMemberId = String(req.body?.memberId || '');
+            const channel = String(req.body?.channel || '');
+            if (!targetMemberId || !VALID_AUDIO_CHANNELS.has(channel)) {
+              throw apiError(400, 'invalid_group_command');
+            }
+            const exists = (current.members || []).some(
+              (item) => item.memberId === targetMemberId,
+            );
+            if (!exists) throw apiError(404, 'group_member_not_found');
+            return {
+              ...current,
+              channelLayout: 'custom',
+              members: (current.members || []).map((item) =>
+                item.memberId === targetMemberId
+                  ? { ...item, audioChannel: channel }
+                  : item,
+              ),
+            };
+          }
+          case 'setChannelLayout': {
+            const layout = String(req.body?.layout || '');
+            if (!Object.prototype.hasOwnProperty.call(CHANNEL_LAYOUT_PRESETS, layout)) {
+              throw apiError(400, 'invalid_group_command');
+            }
+            const slots = CHANNEL_LAYOUT_PRESETS[layout];
+            const orderedOnline = (current.members || [])
+              .filter((item) => isOnline(item, time))
+              .sort((a, b) =>
+                new Date(a.joinedAt || 0).getTime() -
+                new Date(b.joinedAt || 0).getTime(),
+              );
+            const assignments = new Map();
+            orderedOnline.forEach((item, idx) => {
+              assignments.set(
+                item.memberId,
+                slots ? (slots[idx] || 'full') : 'full',
+              );
+            });
+            return {
+              ...current,
+              channelLayout: layout,
+              members: (current.members || []).map((item) => ({
+                ...item,
+                audioChannel: assignments.get(item.memberId) || 'full',
+              })),
+            };
+          }
           case 'end':
             return {
               ...current,
@@ -873,6 +959,50 @@ export function createGroupListeningRouter({
         removeGroupRoomSockets(String(updated._id));
       }
       res.json({ room: publicRoom(updated, time), actorMemberId: member.memberId });
+    } catch (error) { next(error); }
+  });
+
+  router.post('/group-listening/:sessionId/invite-devices', async (req, res, next) => {
+    if (!requirePersonalAccount(req, res)) return;
+    try {
+      const time = now();
+      const deviceId = String(req.body?.deviceId || '');
+      const { room } = await requireMember(
+        groups(), req.params.sessionId, req.user.id, deviceId, time,
+      );
+      const requestedIds = Array.isArray(req.body?.deviceIds)
+        ? new Set(req.body.deviceIds.map((v) => String(v)))
+        : null;
+      const joinedDeviceIds = new Set(
+        (room.members || [])
+          .filter((m) => m.userId === req.user.id)
+          .map((m) => m.deviceId),
+      );
+      const onlineThreshold = new Date(time.getTime() - MEMBER_ONLINE_MS);
+      const devices = await collection('playback_devices')
+        .find({
+          userId: req.user.id,
+          lastSeenAt: { $gte: onlineThreshold },
+        })
+        .toArray();
+      const invitedDeviceIds = [];
+      for (const target of devices) {
+        if (!target.deviceId || target.deviceId === deviceId) continue;
+        if (joinedDeviceIds.has(target.deviceId)) continue;
+        if (target.capabilities?.playback === false) continue;
+        if (requestedIds && !requestedIds.has(target.deviceId)) continue;
+        invitedDeviceIds.push(target.deviceId);
+        publishAccountSyncInvite(req.user.id, target.deviceId, {
+          sessionId: String(room._id),
+          invitationCode: room.code,
+          title: room.title,
+          hostDeviceId: deviceId,
+        });
+      }
+      res.json({
+        invitedDeviceIds,
+        invitationCode: room.code,
+      });
     } catch (error) { next(error); }
   });
 
@@ -926,11 +1056,11 @@ export function createGroupListeningRouter({
         return next;
       }, time);
       if (updated.status === 'ended') {
-        await Promise.all(room.members.map((item) =>
+        await Promise.all(updated.members.map((item) =>
           releasePlaybackDeviceFromGroup({
             userId: item.userId,
             deviceId: item.deviceId,
-            groupSessionId: String(room._id),
+            groupSessionId: String(updated._id),
             collection,
           })));
       }

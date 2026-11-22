@@ -179,6 +179,11 @@ export function publishGroupEvent(sessionId, payload) {
   io.to(groupRoom(sessionId)).emit('group:changed', payload);
 }
 
+export function publishAccountSyncInvite(userId, targetDeviceId, payload) {
+  if (!io || !userId || !targetDeviceId) return;
+  io.to(deviceRoom(userId, targetDeviceId)).emit('account:sync:invite', payload);
+}
+
 export function removeGroupDeviceFromRoom(sessionId, userId, deviceId) {
   if (!io || !sessionId || !userId || !deviceId) return;
   io.in(deviceRoom(userId, deviceId)).socketsLeave(groupRoom(sessionId));

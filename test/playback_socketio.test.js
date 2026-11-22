@@ -45,7 +45,10 @@ async function close(io) {
 test('Socket.IO authenticates devices and uses server-authorized account rooms', async () => {
   const server = createServer();
   const polls = [];
+  const commandAcknowledgments = [];
+  let handoffCommit;
   let commandCreated = false;
+  let prewarmCreated = false;
   const socketServer = attachPlaybackSocketIO(server, {
     apiToken: 'api-token',
     configureEventBus: () => false,
@@ -63,11 +66,23 @@ test('Socket.IO authenticates devices and uses server-authorized account rooms',
     },
     poll: async ({ userId, body }) => {
       polls.push({ userId, body });
+      if (body.deviceId === DEVICE_B && prewarmCreated) {
+        prewarmCreated = false;
+        return {
+          session: null,
+          devices: [],
+          commands: [{
+            id: 'fedcba9876543210fedcba98',
+            action: 'prewarm',
+            payload: { prewarmId: 'warm-switch-00000001', session: { activeDeviceId: DEVICE_A, trackIds: ['track-a'], index: 0 } },
+          }],
+        };
+      }
       return {
         session: null,
         devices: [],
-        commands: commandCreated && body.deviceId === DEVICE_B
-          ? [{ id: COMMAND_ID, action: 'seek', payload: { positionMs: 1200 } }]
+        commands: body.deviceId === DEVICE_B
+          ? commandCreated ? [{ id: COMMAND_ID, action: 'seek', payload: { positionMs: 1200 } }] : []
           : [],
       };
     },
@@ -82,12 +97,33 @@ test('Socket.IO authenticates devices and uses server-authorized account rooms',
         duplicate: false,
       };
     },
-    acknowledgeCommand: async (input) => ({
-      ok: true,
-      commandId: input.commandId,
-      status: input.status,
-      error: input.error || null,
-    }),
+    createPrewarm: async (input) => {
+      assert.equal(input.userId, 'user-a');
+      assert.equal(input.requesterDeviceId, DEVICE_A);
+      assert.equal(input.deviceId, DEVICE_B);
+      prewarmCreated = true;
+      return {
+        commandId: 'fedcba9876543210fedcba98',
+        prewarmId: input.prewarmId,
+        status: 'pending',
+      };
+    },
+    createHandoff: async (input) => {
+      handoffCommit = input;
+      return { transferId: 'handoff-transfer', status: 'pending' };
+    },
+    acknowledgeCommand: async (input) => {
+      commandAcknowledgments.push(input);
+      return {
+        ok: true,
+        commandId: input.commandId,
+        status: input.status,
+        error: input.error || null,
+        ...(input.commandId === 'fedcba9876543210fedcba98'
+          ? { prewarmId: 'warm-switch-00000001', requesterDeviceId: DEVICE_A }
+          : {}),
+      };
+    },
   });
   const origin = await listen(server);
   const clientA = connect(origin);
@@ -117,6 +153,48 @@ test('Socket.IO authenticates devices and uses server-authorized account rooms',
     assert.equal(polls.length, 3);
     assert.equal(polls[0].userId, 'user-a');
 
+    const prewarmAcceptedEvent = once(clientA, 'playback:prewarm:result');
+    const prewarmAccepted = await ack(clientA, 'playback:prewarm', {
+      deviceId: DEVICE_B,
+      prewarmId: 'warm-switch-00000001',
+    });
+    assert.equal(prewarmAccepted.status, 'pending');
+    const [acceptedStatus] = await prewarmAcceptedEvent;
+    assert.equal(acceptedStatus.status, 'accepted');
+    const prewarmResult = once(clientA, 'playback:prewarm:result');
+    const prewarmCommands = await ack(clientPeer, 'playback:sync', {});
+    assert.equal(prewarmCommands.result.commands[0].action, 'prewarm');
+    await ack(clientPeer, 'playback:command:ack', {
+      commandId: 'fedcba9876543210fedcba98', status: 'ok',
+    });
+    const [prewarmReady] = await prewarmResult;
+    assert.equal(prewarmReady.prewarmId, 'warm-switch-00000001');
+    assert.equal(prewarmReady.deviceId, DEVICE_B);
+    assert.equal(prewarmReady.status, 'ready');
+
+    const commit = {
+      deviceId: DEVICE_B,
+      requesterDeviceId: DEVICE_A,
+      prewarmId: 'warm-switch-00000001',
+      positionMs: 12_000,
+      positionTimestamp: '2026-11-20T12:00:00.000Z',
+      playbackRate: 1,
+      queueRevision: 9,
+      scheduledStartAt: '2026-11-20T12:00:00.350Z',
+    };
+    const transfer = await ack(clientA, 'playback:transfer', commit);
+    assert.equal(transfer.status, 'pending');
+    assert.equal(handoffCommit.requesterDeviceId, DEVICE_A);
+    assert.equal(handoffCommit.positionMs, 12_000);
+    assert.equal(handoffCommit.queueRevision, 9);
+    assert.equal(handoffCommit.scheduledStartAt, commit.scheduledStartAt);
+    const wrongRequester = await ack(clientA, 'playback:transfer', {
+      ...commit,
+      requesterDeviceId: DEVICE_B,
+    });
+    assert.equal(wrongRequester.ok, false);
+    assert.equal(wrongRequester.error, 'requester_device_mismatch');
+
     const commandResult = once(clientA, 'playback:command:result');
     const targetNotification = once(clientPeer, 'playback:changed');
     const accepted = await ack(clientA, 'playback:command', {
@@ -141,8 +219,26 @@ test('Socket.IO authenticates devices and uses server-authorized account rooms',
     const acknowledged = await ack(clientPeer, 'playback:command:ack', {
       commandId: COMMAND_ID,
       status: 'ok',
+      snapshot: {
+        trackIds: ['track-a'],
+        index: 0,
+        positionMs: 1200,
+        durationMs: 180_000,
+        volume: 1,
+        playing: true,
+        shuffle: false,
+        repeat: 'none',
+        title: 'Track A',
+        artist: 'Artist A',
+        playbackEpoch: 3,
+      },
     });
     assert.equal(acknowledged.ok, true);
+    assert.equal(
+      commandAcknowledgments.find((item) => item.commandId === COMMAND_ID)
+        .snapshot.positionMs,
+      1200,
+    );
     const [result] = await commandResult;
     assert.equal(result.status, 'ok');
 
@@ -195,6 +291,44 @@ test('Socket.IO rejects invalid session tokens before device registration', asyn
     const [error] = await once(client, 'connect_error');
     assert.equal(error.message, 'session_expired');
   } finally {
+    client.disconnect();
+    await close(socketServer.io);
+  }
+});
+
+test('device registration waits for the playback event bus readiness result', async () => {
+  const server = createServer();
+  let finishEventBusSetup;
+  const eventBusReady = new Promise((resolve) => {
+    finishEventBusSetup = resolve;
+  });
+  const socketServer = attachPlaybackSocketIO(server, {
+    apiToken: 'api-token',
+    configureEventBus: () => eventBusReady,
+    authenticate: async () => ({
+      user: { id: 'user-a' },
+      ownerMode: false,
+    }),
+    poll: async () => ({ session: null, devices: [], commands: [] }),
+  });
+  const origin = await listen(server);
+  const client = connect(origin);
+  try {
+    await once(client, 'connect');
+    const registration = ack(client, 'device:register', {
+      device: { deviceId: DEVICE_A, name: 'Browser', platform: 'web' },
+    });
+    const acknowledgedEarly = await Promise.race([
+      registration.then(() => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), 50)),
+    ]);
+    assert.equal(acknowledgedEarly, false);
+    finishEventBusSetup(false);
+    const result = await registration;
+    assert.equal(result.ok, true);
+    assert.equal(result.crossInstance, false);
+  } finally {
+    finishEventBusSetup?.(false);
     client.disconnect();
     await close(socketServer.io);
   }

@@ -179,6 +179,7 @@ test('group sessions authorize each account and schedule after every online play
   const database = new MemoryDatabase();
   let time = new Date('2026-11-17T00:00:00.000Z');
   const hostDeviceId = '0123456789abcdef0123456789abcdef';
+  const secondHostDeviceId = '1123456789abcdef0123456789abcdef';
   const guestDeviceId = 'abcdef0123456789abcdef0123456789';
   const endHostDeviceId = 'fedcba9876543210fedcba9876543210';
   const allowedTracks = new Map([
@@ -188,6 +189,7 @@ test('group sessions authorize each account and schedule after every online play
   ]);
   for (const [userId, deviceId] of [
     ['host', hostDeviceId],
+    ['host', secondHostDeviceId],
     ['guest', guestDeviceId],
     ['end-host', endHostDeviceId],
   ]) {
@@ -270,8 +272,47 @@ test('group sessions authorize each account and schedule after every online play
     });
     assert.equal(created.response.status, 201);
     assert.equal(created.body.room.hostDeviceId, hostDeviceId);
+    assert.equal(
+      created.body.room.members.find(
+        (member) => member.deviceId === hostDeviceId,
+      ).canControlPlayback,
+      true,
+    );
     const sessionId = created.body.room.sessionId;
     const invitationCode = created.body.room.invitationCode;
+
+    const sameAccountJoin = await request('/group-listening/join', {
+      method: 'POST',
+      body: { invitationCode, deviceId: secondHostDeviceId },
+    });
+    assert.equal(sameAccountJoin.response.status, 201);
+    assert.equal(
+      sameAccountJoin.body.room.members.find(
+        (member) => member.deviceId === secondHostDeviceId,
+      ).canControlPlayback,
+      true,
+    );
+    const sameAccountControl = await request(
+      `/group-listening/${sessionId}/control`,
+      {
+        method: 'POST',
+        body: {
+          deviceId: secondHostDeviceId,
+          action: 'seek',
+          positionMs: 7_000,
+        },
+      },
+    );
+    assert.equal(sameAccountControl.response.status, 200);
+    assert.equal(sameAccountControl.body.room.positionMs, 7_000);
+    const sameAccountLeave = await request(
+      `/group-listening/${sessionId}/leave`,
+      {
+        method: 'POST',
+        body: { deviceId: secondHostDeviceId },
+      },
+    );
+    assert.equal(sameAccountLeave.response.status, 200);
 
     const stalePositionSample = await request(
       `/group-listening/${sessionId}/heartbeat`,
@@ -477,7 +518,7 @@ test('group sessions authorize each account and schedule after every online play
     );
     assert.equal(bufferAvailable.body.room.status, 'scheduled');
 
-    time = new Date(time.getTime() + 7_000);
+    time = new Date(time.getTime() + 16_000);
     const staleReady = await request(`/group-listening/${sessionId}/control`, {
       method: 'POST',
       body: { deviceId: hostDeviceId, action: 'play' },

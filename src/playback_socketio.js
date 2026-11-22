@@ -14,7 +14,10 @@ import {
   acknowledgePlaybackCommand,
   createPlaybackCommand,
   createPlaybackHandoff,
+  createPlaybackPrewarm,
+  cancelPlaybackPrewarm,
   pollPlayback,
+  updatePlaybackPrewarmStatus,
 } from './playback.js';
 import { attachGroupListeningSocketHandlers } from './group_listening.js';
 
@@ -22,6 +25,12 @@ const SOCKET_PATH = '/api/v1/playback/socket';
 const AUTH_TIMEOUT_MS = 5_000;
 const MAX_EVENTS_PER_WINDOW = 40;
 const RATE_WINDOW_MS = 10_000;
+
+function logPlaybackSocket(event, details = {}) {
+  if (process.env.DEBUG_PLAYBACK_SOCKET === 'true') {
+    console.log('[Playback Socket.IO]', event, JSON.stringify(details));
+  }
+}
 
 const deviceSchema = z.object({
   deviceId: z.string().regex(/^[A-Za-z0-9_-]{16,128}$/),
@@ -75,12 +84,36 @@ const commandSchema = z.object({
 
 const transferSchema = z.object({
   deviceId: z.string().regex(/^[A-Za-z0-9_-]{16,128}$/),
+  requesterDeviceId: z.string().regex(/^[A-Za-z0-9_-]{16,128}$/),
+  prewarmId: z.string().regex(/^[A-Za-z0-9_-]{16,128}$/).optional(),
+  positionMs: z.number().int().nonnegative().max(86_400_000),
+  positionTimestamp: z.string().datetime({ offset: true }),
+  playbackRate: z.number().finite().min(0.25).max(4),
+  queueRevision: z.number().int().nonnegative(),
+  scheduledStartAt: z.string().datetime({ offset: true }),
+}).strict();
+
+const prewarmSchema = z.object({
+  deviceId: z.string().regex(/^[A-Za-z0-9_-]{16,128}$/),
+  prewarmId: z.string().regex(/^[A-Za-z0-9_-]{16,128}$/),
+}).strict();
+
+const prewarmStatusSchema = z.object({
+  prewarmId: z.string().regex(/^[A-Za-z0-9_-]{16,128}$/),
+  status: z.enum(['preparing', 'ready', 'failed']),
+  error: z.string().max(120).optional(),
+}).strict();
+
+const cancelPrewarmSchema = z.object({
+  deviceId: z.string().regex(/^[A-Za-z0-9_-]{16,128}$/),
+  prewarmId: z.string().regex(/^[A-Za-z0-9_-]{16,128}$/),
 }).strict();
 
 const commandAckSchema = z.object({
   commandId: z.string().regex(/^[a-fA-F0-9]{24}$/),
   status: z.enum(['ok', 'failed']),
   error: z.string().max(120).optional(),
+  snapshot: snapshotSchema.nullable().optional(),
 }).strict();
 const SUPPORTED_EVENTS = new Set([
   'device:register',
@@ -88,6 +121,9 @@ const SUPPORTED_EVENTS = new Set([
   'playback:sync',
   'playback:command',
   'playback:transfer',
+  'playback:prewarm',
+  'playback:prewarm:status',
+  'playback:prewarm:cancel',
   'playback:command:ack',
   'group:watch',
   'group:unwatch',
@@ -128,6 +164,7 @@ export function attachPlaybackSocketIO(server, {
   poll = pollPlayback,
   createCommand = createPlaybackCommand,
   createHandoff = createPlaybackHandoff,
+  createPrewarm = createPlaybackPrewarm,
   acknowledgeCommand = acknowledgePlaybackCommand,
   configureEventBus = configurePlaybackEventBus,
   onConnectionError = (error) => {
@@ -142,6 +179,12 @@ export function attachPlaybackSocketIO(server, {
     pingInterval: 20_000,
     pingTimeout: 20_000,
   });
+  io.engine.on('connection_error', (error) => {
+    logPlaybackSocket('transport_error', {
+      code: error.code,
+      message: error.message,
+    });
+  });
   attachPlaybackSocketServer(io);
   const eventBusReady = Promise.resolve()
     .then(() => configureEventBus(io))
@@ -153,24 +196,36 @@ export function attachPlaybackSocketIO(server, {
   io.use(async (socket, next) => {
     const token = socket.handshake.auth?.token;
     if (typeof token !== 'string' || token.length === 0 || token.length > 512) {
+      logPlaybackSocket('authentication_failed', {
+        reason: 'authentication_required',
+      });
       next(new Error('authentication_required'));
       return;
     }
     try {
       const result = await authenticate(token, apiToken, { renew: false });
       if (result.ownerMode || !result.user?.id || result.user.id === 'owner') {
+        logPlaybackSocket('authentication_failed', {
+          reason: 'personal_account_required',
+        });
         next(new Error('personal_account_required'));
         return;
       }
       socket.data.userId = result.user.id;
       socket.data.sessionToken = token;
+      logPlaybackSocket('authenticated');
       next();
     } catch (error) {
-      next(new Error(String(error?.code || 'authentication_failed')));
+      const code = String(error?.code || 'authentication_failed');
+      logPlaybackSocket('authentication_failed', { reason: code });
+      next(new Error(code));
     }
   });
 
   io.on('connection', (socket) => {
+    logPlaybackSocket('connected', {
+      transport: socket.conn.transport.name,
+    });
     let device = null;
     let operations = Promise.resolve();
     const rateWindow = [];
@@ -179,7 +234,7 @@ export function attachPlaybackSocketIO(server, {
     }, AUTH_TIMEOUT_MS);
     let sessionVerifyTimer;
 
-    const enqueue = (callback, operation) => {
+    const enqueue = (callback, operation, event = null) => {
       operations = operations.then(async () => {
         if (!rateLimit()) {
           socket.emit('session:error', { error: 'rate_limited' });
@@ -189,6 +244,11 @@ export function attachPlaybackSocketIO(server, {
         try {
           await operation();
         } catch (error) {
+          if (event) {
+            logPlaybackSocket(`${event}_failed`, {
+              reason: error?.code || error?.name || 'unknown_error',
+            });
+          }
           callbackAck(callback, socketFailure(error));
           if (error?.code === 'session_expired' ||
               error?.code === 'session_invalid' ||
@@ -252,8 +312,15 @@ export function attachPlaybackSocketIO(server, {
     };
 
     socket.on('device:register', (raw, callback) => {
+      logPlaybackSocket('register_received', {
+        platform: raw?.device?.platform,
+      });
       enqueue(callback, async () => {
         await ensureAuthenticated();
+        // Redis adapter setup is asynchronous during server startup/restarts.
+        // Do not tell a newly registered device to downgrade to REST recovery
+        // until that setup has settled.
+        await eventBusReady;
         const input = parse(registerSchema, raw);
         if (device && device.deviceId !== input.device.deviceId) {
           throw Object.assign(new Error('device_identity_mismatch'), {
@@ -269,27 +336,32 @@ export function attachPlaybackSocketIO(server, {
           visible: input.device.visible,
         };
         socket.data.deviceId = device.deviceId;
+        socket.data.device = device;
         await socket.join(userRoom(socket.data.userId));
         await socket.join(deviceRoom(socket.data.userId, device.deviceId));
         const result = await sync(input.snapshot ?? null, input.claim === true);
         clearTimeout(authTimeout);
+        clearInterval(sessionVerifyTimer);
         sessionVerifyTimer = setInterval(() => {
           ensureAuthenticated().catch((error) => {
             socket.emit('session:error', socketFailure(error));
             socket.disconnect(true);
           });
         }, 15_000);
+        const crossInstance = playbackEventsAreShared();
         callbackAck(callback, {
           ok: true,
-          crossInstance: playbackEventsAreShared(),
+          crossInstance,
           result,
         });
-      });
+        logPlaybackSocket('register_ack', { crossInstance });
+      }, 'register');
     });
 
     socket.on('device:heartbeat', (raw, callback) => {
       enqueue(callback, async () => {
         await ensureAuthenticated();
+        requireDevice();
         const input = parse(heartbeatSchema, raw);
         callbackAck(callback, {
           ok: true,
@@ -338,13 +410,118 @@ export function attachPlaybackSocketIO(server, {
     socket.on('playback:transfer', (raw, callback) => {
       enqueue(callback, async () => {
         await ensureAuthenticated();
+        const identity = requireDevice();
         const input = parse(transferSchema, raw);
+        if (input.requesterDeviceId !== identity.deviceId) {
+          throw Object.assign(new Error('requester_device_mismatch'), {
+            code: 'requester_device_mismatch',
+            status: 403,
+          });
+        }
         const result = await createHandoff({
           userId: socket.data.userId,
           deviceId: input.deviceId,
+          requesterDeviceId: identity.deviceId,
+          prewarmId: input.prewarmId,
+          positionMs: input.positionMs,
+          positionTimestamp: input.positionTimestamp,
+          playbackRate: input.playbackRate,
+          queueRevision: input.queueRevision,
+          scheduledStartAt: input.scheduledStartAt,
           collection,
           now,
         });
+        callbackAck(callback, { ok: true, ...result });
+      });
+    });
+
+    socket.on('playback:prewarm', (raw, callback) => {
+      enqueue(callback, async () => {
+        await ensureAuthenticated();
+        const identity = requireDevice();
+        const input = parse(prewarmSchema, raw);
+        const result = await createPrewarm({
+          userId: socket.data.userId,
+          requesterDeviceId: identity.deviceId,
+          deviceId: input.deviceId,
+          prewarmId: input.prewarmId,
+          collection,
+          now,
+        });
+        io.to(deviceRoom(socket.data.userId, input.deviceId)).emit(
+          'playback:prewarm:request',
+          {
+            prewarmId: input.prewarmId,
+            requesterDeviceId: identity.deviceId,
+          },
+        );
+        io.to(deviceRoom(socket.data.userId, identity.deviceId)).emit(
+          'playback:prewarm:result',
+          {
+            prewarmId: input.prewarmId,
+            deviceId: input.deviceId,
+            status: 'accepted',
+            error: null,
+          },
+        );
+        callbackAck(callback, { ok: true, ...result });
+      });
+    });
+
+    socket.on('playback:prewarm:status', (raw, callback) => {
+      enqueue(callback, async () => {
+        await ensureAuthenticated();
+        const identity = requireDevice();
+        const input = parse(prewarmStatusSchema, raw);
+        const result = await updatePlaybackPrewarmStatus({
+          userId: socket.data.userId,
+          deviceId: identity.deviceId,
+          ...input,
+          collection,
+          now,
+        });
+        if (!result.stale && result.requesterDeviceId) {
+          io.to(deviceRoom(socket.data.userId, result.requesterDeviceId)).emit(
+            'playback:prewarm:result',
+            {
+              prewarmId: result.prewarmId,
+              deviceId: result.deviceId,
+              status: result.status,
+              error: result.error,
+            },
+          );
+        }
+        callbackAck(callback, { ok: true, ...result });
+      });
+    });
+
+    socket.on('playback:prewarm:cancel', (raw, callback) => {
+      enqueue(callback, async () => {
+        await ensureAuthenticated();
+        const identity = requireDevice();
+        const input = parse(cancelPrewarmSchema, raw);
+        const result = await cancelPlaybackPrewarm({
+          userId: socket.data.userId,
+          requesterDeviceId: identity.deviceId,
+          ...input,
+          collection,
+          now,
+        });
+        if (result.cancelled) {
+          io.to(deviceRoom(socket.data.userId, result.deviceId)).emit(
+            'playback:prewarm:cancel',
+            { prewarmId: result.prewarmId },
+          );
+          io.to(deviceRoom(socket.data.userId, identity.deviceId)).emit(
+            'playback:prewarm:result',
+            {
+              prewarmId: result.prewarmId,
+              deviceId: result.deviceId,
+              status: 'cancelled',
+              error: null,
+            },
+          );
+        }
         callbackAck(callback, { ok: true, ...result });
       });
     });
@@ -360,6 +537,7 @@ export function attachPlaybackSocketIO(server, {
           deviceId: identity.deviceId,
           status: input.status,
           error: input.error,
+          snapshot: input.snapshot,
           collection,
           now,
         });
@@ -373,13 +551,53 @@ export function attachPlaybackSocketIO(server, {
             },
           );
         }
+        if (result.prewarmId && result.requesterDeviceId) {
+          io.to(deviceRoom(socket.data.userId, result.requesterDeviceId)).emit(
+            'playback:prewarm:result',
+            {
+              prewarmId: result.prewarmId,
+              deviceId: identity.deviceId,
+              status: result.status === 'ok' ? 'ready' : 'failed',
+              error: result.error || null,
+            },
+          );
+        }
+        if (result.transferId && result.transferStatus) {
+          io.to(userRoom(socket.data.userId)).emit(
+            'playback:transfer:result',
+            {
+              transferId: result.transferId,
+              status: result.transferStatus,
+              error: result.transferError || null,
+            },
+          );
+        }
         callbackAck(callback, { ok: true, ...result });
       });
     });
 
     socket.on('disconnect', () => {
+      logPlaybackSocket('disconnected');
       clearTimeout(authTimeout);
       clearInterval(sessionVerifyTimer);
+      // CP-B4: Mark device as disconnected in DB so it doesn't appear online
+      // for up to 12 seconds after the socket drops.
+      const currentDevice = device || socket.data?.device;
+      if (currentDevice && socket.data?.userId) {
+        try {
+          const devices = collection?.('playback_devices');
+          if (typeof devices?.updateOne === 'function') {
+            devices.updateOne(
+              { userId: socket.data.userId, deviceId: currentDevice.deviceId },
+              { $set: { disconnectedAt: now() } },
+            ).catch((err) => {
+              console.error('Failed to update disconnectedAt on disconnect:', err.name);
+            });
+          }
+        } catch (err) {
+          console.error('Failed to update disconnectedAt on disconnect:', err.name);
+        }
+      }
     });
     socket.on('error', onConnectionError);
   });

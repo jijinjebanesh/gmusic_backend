@@ -184,6 +184,11 @@ export function publishAccountSyncInvite(userId, targetDeviceId, payload) {
   io.to(deviceRoom(userId, targetDeviceId)).emit('account:sync:invite', payload);
 }
 
+export function publishAccountGroupCallState(userId, payload) {
+  if (!io || !userId) return;
+  io.to(userRoom(userId)).emit('group:account-call-state', payload);
+}
+
 export function removeGroupDeviceFromRoom(sessionId, userId, deviceId) {
   if (!io || !sessionId || !userId || !deviceId) return;
   io.in(deviceRoom(userId, deviceId)).socketsLeave(groupRoom(sessionId));

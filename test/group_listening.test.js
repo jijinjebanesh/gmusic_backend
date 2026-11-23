@@ -305,6 +305,52 @@ test('group sessions authorize each account and schedule after every online play
     );
     assert.equal(sameAccountControl.response.status, 200);
     assert.equal(sameAccountControl.body.room.positionMs, 7_000);
+    const shuffleEnabled = await request(
+      `/group-listening/${sessionId}/control`,
+      {
+        method: 'POST',
+        body: {
+          deviceId: secondHostDeviceId,
+          action: 'setShuffle',
+          enabled: true,
+        },
+      },
+    );
+    assert.equal(shuffleEnabled.response.status, 200);
+    assert.equal(shuffleEnabled.body.room.shuffle, true);
+    assert.equal(shuffleEnabled.body.room.trackIds[0], 'track-a');
+
+    const repeatAll = await request(
+      `/group-listening/${sessionId}/control`,
+      {
+        method: 'POST',
+        body: {
+          deviceId: secondHostDeviceId,
+          action: 'setRepeat',
+          mode: 'all',
+        },
+      },
+    );
+    assert.equal(repeatAll.response.status, 200);
+    assert.equal(repeatAll.body.room.repeat, 'all');
+
+    const advanceToLastTrack = await request(
+      `/group-listening/${sessionId}/control`,
+      {
+        method: 'POST',
+        body: { deviceId: secondHostDeviceId, action: 'next' },
+      },
+    );
+    assert.equal(advanceToLastTrack.body.room.index, 1);
+    const repeatFromLastTrack = await request(
+      `/group-listening/${sessionId}/control`,
+      {
+        method: 'POST',
+        body: { deviceId: secondHostDeviceId, action: 'next' },
+      },
+    );
+    assert.equal(repeatFromLastTrack.body.room.index, 0);
+
     const sameAccountLeave = await request(
       `/group-listening/${sessionId}/leave`,
       {
@@ -313,6 +359,74 @@ test('group sessions authorize each account and schedule after every online play
       },
     );
     assert.equal(sameAccountLeave.response.status, 200);
+
+    const storedRoom = await database
+      .collection('group_listening_sessions')
+      .findOne({ _id: new ObjectId(sessionId) });
+    await database.collection('group_listening_sessions').updateOne(
+      { _id: storedRoom._id },
+      {
+        $set: {
+          index: 1,
+          playing: true,
+          status: 'playing',
+          repeat: 'all',
+          positionMs: 0,
+          durationMs: 1_000,
+          startAtServerTime: new Date(time.getTime() - 2_000).toISOString(),
+        },
+      },
+    );
+    const repeatedQueueHeartbeat = await request(
+      `/group-listening/${sessionId}/heartbeat`,
+      {
+        method: 'POST',
+        body: {
+          deviceId: hostDeviceId,
+          ready: true,
+          trackId: 'track-b',
+          positionMs: 1_000,
+          durationMs: 1_000,
+          bufferedMs: 1_000,
+          positionTimestampMs: time.getTime(),
+        },
+      },
+    );
+    assert.equal(repeatedQueueHeartbeat.body.room.index, 0);
+    assert.equal(repeatedQueueHeartbeat.body.room.status, 'preparing');
+
+    await database.collection('group_listening_sessions').updateOne(
+      { _id: storedRoom._id },
+      {
+        $set: {
+          index: 0,
+          playing: true,
+          status: 'playing',
+          repeat: 'one',
+          positionMs: 0,
+          durationMs: 1_000,
+          startAtServerTime: new Date(time.getTime() - 2_000).toISOString(),
+        },
+      },
+    );
+    const repeatOneHeartbeat = await request(
+      `/group-listening/${sessionId}/heartbeat`,
+      {
+        method: 'POST',
+        body: {
+          deviceId: hostDeviceId,
+          ready: true,
+          trackId: 'track-a',
+          positionMs: 1_000,
+          durationMs: 1_000,
+          bufferedMs: 1_000,
+          positionTimestampMs: time.getTime(),
+        },
+      },
+    );
+    assert.equal(repeatOneHeartbeat.body.room.index, 0);
+    assert.equal(repeatOneHeartbeat.body.room.repeat, 'one');
+    assert.equal(repeatOneHeartbeat.body.room.status, 'preparing');
 
     const stalePositionSample = await request(
       `/group-listening/${sessionId}/heartbeat`,
@@ -398,7 +512,13 @@ test('group sessions authorize each account and schedule after every online play
     allowedTracks.get('guest').delete('track-b');
     allowedTracks.get('host').add('track-c');
 
-    for (const action of ['play', 'queueRemove', 'end']) {
+    for (const action of [
+      'play',
+      'queueRemove',
+      'setShuffle',
+      'setRepeat',
+      'end',
+    ]) {
       const forbidden = await request(
         `/group-listening/${sessionId}/control`,
         {

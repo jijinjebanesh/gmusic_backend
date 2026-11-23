@@ -5,6 +5,8 @@ import crypto from 'node:crypto';
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import { ObjectId } from 'mongodb';
+import { getAuth } from 'firebase-admin/auth';
+import { getApps, initializeApp } from 'firebase-admin/app';
 import { col, mongoEnabled } from './db.js';
 
 const SESSION_DAYS = 30;
@@ -21,6 +23,13 @@ const publicUser = (user) => ({
 });
 const authenticationError = (status, code) =>
   Object.assign(new Error(code), { status, code });
+
+export function verifyFirebaseIdToken(idToken, projectId) {
+  const app =
+    getApps().find((candidate) => candidate.name === 'gmusic-auth') ??
+    initializeApp({ projectId }, 'gmusic-auth');
+  return getAuth(app).verifyIdToken(idToken);
+}
 
 async function createSession(user) {
   const token = crypto.randomBytes(32).toString('base64url');
@@ -78,6 +87,90 @@ authRoutes.post('/login', express.json(), async (req, res) => {
     }
     res.json({ token: await createSession(user), user: publicUser(user) });
   } catch (err) { req.log?.error({ err }, 'login failed'); branch(res); }
+});
+
+authRoutes.post('/google', express.json(), async (req, res) => {
+  if (!mongoEnabled()) return branch(res);
+  const idToken = String(req.body?.idToken || '').trim();
+  if (!idToken) return branch(res, { status: 400, error: 'id_token_required' });
+
+  const firebaseProjectId = process.env.FIREBASE_PROJECT_ID?.trim();
+  if (!firebaseProjectId) {
+    return branch(res, { status: 503, error: 'firebase_auth_not_configured' });
+  }
+
+  let claims;
+  try {
+    claims = await verifyFirebaseIdToken(idToken, firebaseProjectId);
+  } catch (error) {
+    req.log?.warn(
+      { code: error?.code || error?.name || 'invalid_firebase_token' },
+      'Firebase ID token verification failed',
+    );
+    return branch(res, { status: 401, error: 'invalid_firebase_identity' });
+  }
+  if (
+    claims.email_verified !== true ||
+    typeof claims.email !== 'string' ||
+    !claims.email
+  ) {
+    return branch(res, { status: 401, error: 'invalid_firebase_identity' });
+  }
+
+  try {
+    const email = String(claims.email).trim().toLowerCase();
+    const username = String(claims.name || '').trim() || email.split('@')[0];
+    const users = col('Users');
+    let user = await users.findOne({
+      $or: [{ googleUid: claims.sub }, { email }],
+    });
+    const now = new Date();
+
+    if (user) {
+      await users.updateOne(
+        { _id: user._id },
+        {
+          $set: {
+            googleUid: claims.sub,
+            email,
+            ...(user.displayName ? {} : { displayName: username }),
+            ...(user.username ? {} : { username }),
+            updatedAt: now,
+          },
+        },
+      );
+      user = await users.findOne({ _id: user._id });
+    } else {
+      const inserted = await users.insertOne({
+        email,
+        username,
+        displayName: username,
+        googleUid: claims.sub,
+        role: 'user',
+        createdAt: now,
+        updatedAt: now,
+      });
+      user = {
+        _id: inserted.insertedId,
+        email,
+        username,
+        displayName: username,
+        googleUid: claims.uid,
+        role: 'user',
+      };
+    }
+
+    res.json({
+      token: await createSession(user),
+      user: publicUser(user),
+    });
+  } catch (error) {
+    req.log?.error(
+      { code: error?.code || error?.name || 'google_auth_error' },
+      'Google account session creation failed',
+    );
+    return branch(res);
+  }
 });
 
 // ---- session middleware ---------------------------------------------------

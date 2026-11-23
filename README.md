@@ -34,6 +34,7 @@ OAuth client secret anywhere but this service.
 | `POST /api/v1/group-listening` · `POST /api/v1/group-listening/join` | Create a Group Listening room or join by invitation code |
 | `GET /api/v1/group-listening/:sessionId` · `POST .../:sessionId/heartbeat` | Fetch room state or report readiness, clock offset, playback position and output-latency compensation |
 | `POST /api/v1/group-listening/:sessionId/control` · `POST .../:sessionId/leave` | Control shared playback/queue or leave the room |
+| `POST /api/v1/group-listening/:sessionId/account-call-state` | Pause or resume this account's devices in a shared room when a call interrupts playback |
 | `GET /api/v1/artists` · `GET /api/v1/artists/:id/*` | Indexed artist aggregates, tracks and albums |
 | `GET /api/v1/albums` · `GET /api/v1/albums/:id/*` | Indexed album aggregates and ordered tracks |
 | `GET /api/v1/genres` · `GET /api/v1/genres/:id/tracks` | Indexed genres and matching tracks |

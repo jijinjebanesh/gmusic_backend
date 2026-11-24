@@ -68,6 +68,11 @@ async function ensureIndexes() {
   await tracks.createIndex({ ownerId: 1, albumId: 1, discNumber: 1, trackNumber: 1 });
   await tracks.createIndex({ ownerId: 1, 'genreEntries.key': 1, availability: 1 });
   await db.collection('artwork_cache').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+  await db.collection('quality_renditions').createIndex(
+    { ownerId: 1, driveFileId: 1, sourceVersion: 1, quality: 1 },
+    { unique: true, name: 'uniq_owner_source_quality' },
+  );
+  await db.collection('quality_renditions').createIndex({ ownerId: 1, driveFileId: 1, quality: 1, updatedAt: -1 });
   await db.collection('drive_connections').createIndex({ userId: 1 }, { unique: true });
   await db.collection('drive_oauth_states').createIndex({ stateHash: 1 }, { unique: true });
   await db.collection('drive_oauth_states').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });

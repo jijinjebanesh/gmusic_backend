@@ -40,6 +40,7 @@ import { getDriveIndexStatus, syncDriveBatch } from './indexer.js';
 import { createDriveSyncScheduler } from './drive_sync_scheduler.js';
 import { resolveOAuthRedirectUri } from './oauth_redirect_uri.js';
 import { normalizeStreamHeaders } from './stream_headers.js';
+import { createRenditionService, RENDITION_QUALITIES, sourceVersion } from './renditions.js';
 
 const app = express();
 app.disable('x-powered-by');
@@ -48,7 +49,7 @@ app.set('trust proxy', true);
 // origin differs from this loopback service, so respond with permissive CORS.
 app.use((req, res, next) => {
   res.setHeader('access-control-allow-origin', '*');
-  res.setHeader('access-control-allow-methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.setHeader('access-control-allow-methods', 'GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS');
   res.setHeader('access-control-allow-headers', 'authorization,content-type,range');
   res.setHeader('access-control-expose-headers', 'content-length,content-range,accept-ranges');
   if (req.method === 'OPTIONS') return res.status(204).end();
@@ -115,6 +116,30 @@ function readTicket(ticket) {
     return null;
   }
 }
+function signRenditionTicket(fileId, renditionFileId, fileSize, ownerId, version, quality, expiresAt) {
+  const payload = Buffer.from(JSON.stringify({
+    type: 'rendition', id: fileId, renditionFileId, fileSize, ownerId,
+    sourceVersion: version, quality, exp: expiresAt,
+  })).toString('base64url');
+  const mac = crypto.createHmac('sha256', apiToken).update(payload).digest('base64url');
+  return `${payload}.${mac}`;
+}
+function readRenditionTicket(ticket) {
+  const [payload, mac] = String(ticket || '').split('.');
+  if (!payload || !mac) return null;
+  const expected = Buffer.from(crypto.createHmac('sha256', apiToken).update(payload).digest('base64url'));
+  const given = Buffer.from(mac);
+  if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
+  try {
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
+    return data?.type === 'rendition' && data.id && data.ownerId &&
+      data.sourceVersion && data.renditionFileId && Number.isSafeInteger(data.fileSize) &&
+      RENDITION_QUALITIES[data.quality] && data.exp >= Date.now()
+      ? data : null;
+  } catch {
+    return null;
+  }
+}
 // Local token-only development stays available, but production and explicitly
 // configured deployments must never silently downgrade when Atlas is missing.
 const mongoRequired = process.env.REQUIRE_MONGO === 'true' || onVercel;
@@ -171,6 +196,7 @@ async function driveForOwner(ownerId) {
   return driveConnections.getDrive(ownerId);
 }
 const requestDrive = (req) => driveForOwner(driveOwner(req));
+const renditionService = createRenditionService();
 const AUTO_SYNC_BATCH_LIMIT = 8;
 const driveSyncRuns = new Map();
 
@@ -427,6 +453,59 @@ app.get('/api/v1/catalog/tracks/:id/lyrics', async (req, res, next) => {
     res.json({ lyrics });
   } catch (error) { next(error); }
 });
+app.get('/api/v1/tracks/:id/quality/:quality', async (req, res, next) => {
+  try {
+    const ownerId = driveOwner(req);
+    const track = await getTrack(req.params.id, ownerId);
+    if (!track) return res.status(404).json({ error: 'track_not_found' });
+    const quality = String(req.params.quality).toLowerCase();
+    if (quality === 'original') {
+      return res.json({ status: 'ready', quality, streamUrl: mediaUrls(req, track.id, ownerId).streamUrl });
+    }
+    if (!RENDITION_QUALITIES[quality]) return res.status(400).json({ error: 'invalid_quality' });
+    const result = await renditionService.prepare({
+      ownerId, track, drive: await requestDrive(req), quality,
+    });
+    if (result.status === 'missing') {
+      return res.status(404).json({ error: 'rendition_not_prepared' });
+    }
+    if (result.status === 'ready') {
+      const expiresAt = Date.now() + 8 * 60 * 60_000;
+      const ticket = signRenditionTicket(
+        track.id, result.renditionDriveFileId, result.fileSize,
+        ownerId, result.sourceVersion, quality, expiresAt,
+      );
+      return res.json({
+        ...result,
+        streamUrl: `${publicOrigin(req)}/stream-quality/${ticket}`,
+      });
+    }
+    return res.status(result.status === 'failed' ? 200 : 202).json(result);
+  } catch (error) { next(error); }
+});
+app.get('/api/v1/renditions/:jobId', async (req, res, next) => {
+  try {
+    const result = await renditionService.status(req.params.jobId, driveOwner(req));
+    if (!result) return res.status(404).json({ error: 'rendition_not_found' });
+    if (result.status === 'ready') {
+      const userDrive = await requestDrive(req);
+      const currentFile = await userDrive.getFileMetadata(result.trackId);
+      if (sourceVersion(currentFile) !== result.sourceVersion) {
+        return res.status(410).json({ error: 'rendition_source_changed' });
+      }
+      const expiresAt = Date.now() + 8 * 60 * 60_000;
+      const ticket = signRenditionTicket(
+        result.trackId, result.renditionDriveFileId, result.fileSize, driveOwner(req),
+        result.sourceVersion, result.quality, expiresAt,
+      );
+      return res.json({
+        ...result,
+        streamUrl: `${publicOrigin(req)}/stream-quality/${ticket}`,
+      });
+    }
+    return res.status(result.status === 'failed' ? 200 : 202).json(result);
+  } catch (error) { next(error); }
+});
 app.get('/api/v1/artists', async (req, res, next) => {
   try { res.json(await listArtists({ ...req.query, ownerId: driveOwner(req) })); } catch (error) { next(error); }
 });
@@ -581,6 +660,43 @@ app.get('/api/v1/tracks/:id/stream', allowCrossOriginMedia, async (req, res, nex
     });
     result.stream.pipe(res);
   } catch (err) { next(err); }
+});
+async function qualityStream(req, res, next, headOnly = false) {
+  const ticket = readRenditionTicket(req.params.ticket);
+  if (!ticket) return res.status(401).end();
+  try {
+    const userDrive = await driveForOwner(ticket.ownerId);
+    const currentFile = await userDrive.getFileMetadata(ticket.id);
+    if (sourceVersion(currentFile) !== ticket.sourceVersion) {
+      return res.status(410).json({ error: 'rendition_source_changed' });
+    }
+    const args = {
+      drive: userDrive,
+      renditionDriveFileId: ticket.renditionFileId,
+      fileSize: ticket.fileSize,
+      range: req.get('range'),
+    };
+    const result = headOnly
+      ? await renditionService.head(args)
+      : await renditionService.open(args);
+    if (!result) return res.status(404).end();
+    res.status(result.status);
+    for (const [key, value] of Object.entries(result.headers || {})) {
+      if (value != null) res.setHeader(key, value);
+    }
+    if (result.status === 416 || headOnly || !result.body) return res.end();
+    result.body.on('error', next);
+    res.on('close', () => {
+      if (!res.writableEnded) result.body.destroy?.();
+    });
+    result.body.pipe(res);
+  } catch (error) { next(error); }
+}
+app.head('/stream-quality/:ticket', allowCrossOriginMedia, (req, res, next) => {
+  void qualityStream(req, res, next, true);
+});
+app.get('/stream-quality/:ticket', allowCrossOriginMedia, (req, res, next) => {
+  void qualityStream(req, res, next);
 });
 app.use((err, _req, res, _next) => {
   if (err?.type === 'entity.parse.failed') {

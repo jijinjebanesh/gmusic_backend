@@ -260,6 +260,7 @@ function trackForApi(doc) {
     trackNumber: doc.trackNumber,
     discNumber: doc.discNumber,
     durationMs: doc.durationMs,
+    bitrate: doc.bitrate || null,
     metadataStatus: doc.metadataStatus,
     availability: doc.availability,
   };

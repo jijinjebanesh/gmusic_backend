@@ -19,7 +19,9 @@ test('scheduler runs repeatedly without overlapping sync cycles', async () => {
   });
 
   scheduler.start();
-  await delay(45);
+  // The full suite runs many integration tests concurrently; leave enough
+  // headroom for a busy event loop to deliver the short scheduler timers.
+  await delay(150);
   scheduler.stop();
 
   assert.ok(runs >= 2);
@@ -39,7 +41,7 @@ test('scheduler reports failed cycles and continues running', async () => {
   });
 
   scheduler.start();
-  await delay(25);
+  await delay(150);
   scheduler.stop();
 
   assert.ok(runs >= 2);

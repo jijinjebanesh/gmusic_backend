@@ -50,6 +50,7 @@ export function createDisabledDrive(reason = 'drive_not_configured') {
     getStartPageToken: notConfigured,
     listChanges: notConfigured,
     openFile: notConfigured,
+    getFileMetadata: notConfigured,
     coverArt: notConfigured,
   };
 }
@@ -235,6 +236,23 @@ export async function createDriveSession({
           ...(contentRange ? { 'content-range': contentRange } : {}),
           ...(acceptRanges ? { 'accept-ranges': acceptRanges } : {}),
         },
+      };
+    },
+    async getFileMetadata(id) {
+      assertTokenPersistence();
+      const result = await drive.files.get({
+        fileId: id,
+        fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,capabilities(canDownload)',
+      });
+      const file = result.data;
+      return {
+        id: file.id,
+        name: file.name,
+        mimeType: file.mimeType,
+        size: file.size || null,
+        modifiedTime: file.modifiedTime || null,
+        md5Checksum: file.md5Checksum || null,
+        canDownload: file.capabilities?.canDownload !== false,
       };
     },
     // Drive returns no thumbnailLink for audio files, so artwork comes from the

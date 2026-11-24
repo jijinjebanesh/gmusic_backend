@@ -1,5 +1,11 @@
 # Secrets and local state stay off GitHub
 node_modules/
+temp_file_convert_upload_python/
+temp_file_convert_upload_python/venv/
+temp_file_convert_upload_python/token.json
+temp_file_convert_upload_python/gmusic_state.db
+temp_file_convert_upload_python/audio_processor.log
+temp_file_convert_upload_python/__pycache__/
 .env
 .env.*
 credentials*.json

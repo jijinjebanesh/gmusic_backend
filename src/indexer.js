@@ -28,6 +28,12 @@ function ownerScope(ownerId, filter = {}) {
   return { ...filter, ownerId };
 }
 
+function isGeneratedQualityRendition(file) {
+  const properties = file.appProperties || {};
+  if (properties.gmusicOriginalId && ['low', 'medium', 'high'].includes(properties.gmusicQuality)) return true;
+  return /^[A-Za-z0-9_-]{20,}_(64|128|256)k\.mp3$/i.test(file.name || '');
+}
+
 export async function extractAudioMetadata(stream, file) {
   return parseStream(
     stream,
@@ -129,12 +135,18 @@ async function beginFullScan(drive, previous = {}, collection = col, ownerId = S
 }
 
 async function indexFile(drive, file, scanId, collection = col, ownerId = SHARED_OWNER_ID) {
+  const tracks = collection(TRACKS_COLLECTION);
+  const documentId = trackId(ownerId, file.id);
+  if (isGeneratedQualityRendition(file)) {
+    await tracks.updateOne({ _id: documentId }, {
+      $set: { availability: 'unavailable', isQualityRendition: true, updatedAt: new Date() },
+    });
+    return { supported: false, failed: false, qualityRendition: true };
+  }
   if (!isSupportedAudioFile(file)) {
     return { supported: false, failed: false };
   }
 
-  const tracks = collection(TRACKS_COLLECTION);
-  const documentId = trackId(ownerId, file.id);
   const existing = await tracks.findOne(
     { _id: documentId },
     { projection: { modifiedTime: 1, md5Checksum: 1, availability: 1, metadataStatus: 1, metadataVersion: 1 } },

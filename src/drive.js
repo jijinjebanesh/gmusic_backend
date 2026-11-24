@@ -157,7 +157,7 @@ export async function createDriveSession({
         pageSize: Math.min(Math.max(Number(pageSize) || 8, 1), 100),
         pageToken,
         orderBy: 'name',
-        fields: 'nextPageToken,files(id,name,mimeType,size,modifiedTime,createdTime,md5Checksum,parents,owners(displayName,emailAddress))',
+        fields: 'nextPageToken,files(id,name,mimeType,size,modifiedTime,createdTime,md5Checksum,parents,owners(displayName,emailAddress),appProperties)',
       });
       return {
         files: (result.data.files || []).map((file) => ({
@@ -169,6 +169,7 @@ export async function createDriveSession({
           createdTime: file.createdTime || null,
           md5Checksum: file.md5Checksum || null,
           parentIds: file.parents || [],
+          appProperties: file.appProperties || {},
           owners: (file.owners || []).map(({ displayName, emailAddress }) => ({
             displayName,
             emailAddress,
@@ -187,7 +188,7 @@ export async function createDriveSession({
       const result = await drive.changes.list({
         pageToken,
         pageSize: Math.min(Math.max(Number(pageSize) || 8, 1), 100),
-        fields: 'nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,size,modifiedTime,createdTime,md5Checksum,parents,owners(displayName,emailAddress),trashed))',
+        fields: 'nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,size,modifiedTime,createdTime,md5Checksum,parents,owners(displayName,emailAddress),appProperties,trashed))',
       });
       return {
         changes: (result.data.changes || []).map((change) => ({
@@ -202,6 +203,7 @@ export async function createDriveSession({
             createdTime: change.file.createdTime || null,
             md5Checksum: change.file.md5Checksum || null,
             parentIds: change.file.parents || [],
+            appProperties: change.file.appProperties || {},
             owners: (change.file.owners || []).map(({ displayName, emailAddress }) => ({
               displayName,
               emailAddress,

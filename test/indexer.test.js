@@ -139,6 +139,49 @@ test('indexing stores embedded lyrics and upgrades older metadata records', asyn
   assert.equal(indexed.metadataVersion, 2);
 });
 
+test('generated quality MP3 files are excluded from the playable catalog', async () => {
+  const database = new MemoryDatabase();
+  const collection = (name) => database.collection(name);
+  const variant = {
+    id: 'rendition-drive-id',
+    name: '1YJlj86lrs3NS_9gkvs4tJs2YyWBsMa-1_128k.mp3',
+    mimeType: 'audio/mpeg',
+    size: '1200',
+    appProperties: {
+      gmusicOriginalId: '1YJlj86lrs3NS_9gkvs4tJs2YyWBsMa-1',
+      gmusicQuality: 'medium',
+    },
+  };
+  const variantWithoutVisibleAppProperties = {
+    id: 'second-rendition-drive-id',
+    name: '1YJlj86lrs3NS_9gkvs4tJs2YyWBsMa-1_64k.mp3',
+    mimeType: 'audio/mpeg',
+    size: '800',
+  };
+  const tracks = collection('drive_tracks');
+  for (const file of [variant, variantWithoutVisibleAppProperties]) {
+    tracks.documents.set(file.id, {
+      _id: file.id,
+      ownerId: 'shared',
+      driveFileId: file.id,
+      name: file.name,
+      availability: 'available',
+    });
+  }
+  const drive = {
+    async getStartPageToken() { return 'change-1'; },
+    async listAudioCandidates() { return { files: [variant, variantWithoutVisibleAppProperties], nextPageToken: null }; },
+    async openFile() { throw new Error('quality variants must never be parsed as catalog tracks'); },
+    async listChanges() { return { changes: [], newStartPageToken: 'change-2' }; },
+  };
+
+  await syncDriveBatch(drive, { collection, isMongoEnabled: () => true });
+  const hidden = tracks.documents.get(variant.id);
+  assert.equal(hidden.availability, 'unavailable');
+  assert.equal(hidden.isQualityRendition, true);
+  assert.equal(tracks.documents.get(variantWithoutVisibleAppProperties.id).availability, 'unavailable');
+});
+
 test('full indexing resumes between pages, then incremental changes update and remove tracks', async () => {
   const database = new MemoryDatabase();
   const collection = (name) => database.collection(name);

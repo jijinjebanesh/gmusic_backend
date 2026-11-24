@@ -9,6 +9,11 @@ const PAGE_SIZE = 8;
 const MAX_METADATA_ALLOCATION = 4 * 1024 * 1024;
 const MAX_LYRICS_LENGTH = 64_000;
 const METADATA_VERSION = 2;
+const QUALITY_FOLDER_IDS = new Set([
+  '1mOAB3J3GZq8pjEfuIRdH4UnTcMdJiPWp', // Low
+  '1DVWzPZvJP4HKTih31UzgwuBGCMZhf-aV', // Medium
+  '1iLjc9NoHF8JEiwKb79W1iNdItGfoap4y', // High
+]);
 
 function stateId(ownerId) {
   return ownerId === SHARED_OWNER_ID ? 'primary' : String(ownerId);
@@ -31,6 +36,7 @@ function ownerScope(ownerId, filter = {}) {
 function isGeneratedQualityRendition(file) {
   const properties = file.appProperties || {};
   if (properties.gmusicOriginalId && ['low', 'medium', 'high'].includes(properties.gmusicQuality)) return true;
+  if ((file.parentIds || []).some((parentId) => QUALITY_FOLDER_IDS.has(parentId))) return true;
   return /^[A-Za-z0-9_-]{20,}_(64|128|256)k\.mp3$/i.test(file.name || '');
 }
 

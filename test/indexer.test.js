@@ -158,8 +158,15 @@ test('generated quality MP3 files are excluded from the playable catalog', async
     mimeType: 'audio/mpeg',
     size: '800',
   };
+  const variantLocatedInQualityFolder = {
+    id: 'third-rendition-drive-id',
+    name: '1 XvrA9Zf-uAl-GBQpmUpNPg4DfDg1 BOro-256k.mp3',
+    mimeType: 'audio/mpeg',
+    size: '900',
+    parentIds: ['1iLjc9NoHF8JEiwKb79W1iNdItGfoap4y'],
+  };
   const tracks = collection('drive_tracks');
-  for (const file of [variant, variantWithoutVisibleAppProperties]) {
+  for (const file of [variant, variantWithoutVisibleAppProperties, variantLocatedInQualityFolder]) {
     tracks.documents.set(file.id, {
       _id: file.id,
       ownerId: 'shared',
@@ -170,7 +177,7 @@ test('generated quality MP3 files are excluded from the playable catalog', async
   }
   const drive = {
     async getStartPageToken() { return 'change-1'; },
-    async listAudioCandidates() { return { files: [variant, variantWithoutVisibleAppProperties], nextPageToken: null }; },
+    async listAudioCandidates() { return { files: [variant, variantWithoutVisibleAppProperties, variantLocatedInQualityFolder], nextPageToken: null }; },
     async openFile() { throw new Error('quality variants must never be parsed as catalog tracks'); },
     async listChanges() { return { changes: [], newStartPageToken: 'change-2' }; },
   };
@@ -180,6 +187,7 @@ test('generated quality MP3 files are excluded from the playable catalog', async
   assert.equal(hidden.availability, 'unavailable');
   assert.equal(hidden.isQualityRendition, true);
   assert.equal(tracks.documents.get(variantWithoutVisibleAppProperties.id).availability, 'unavailable');
+  assert.equal(tracks.documents.get(variantLocatedInQualityFolder.id).availability, 'unavailable');
 });
 
 test('full indexing resumes between pages, then incremental changes update and remove tracks', async () => {

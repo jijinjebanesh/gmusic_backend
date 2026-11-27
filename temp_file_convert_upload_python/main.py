@@ -4,10 +4,15 @@ GMusic Offline Parallel Audio Quality Generator
 - Parallel song processing with live per-song & overall Rich dashboard
 - Real-time FFmpeg transcode progress + Drive download/upload progress
 - CPU & Memory limit enforcement + FFmpeg thread capping
-- Automatic resume after Ctrl+C via local SQLite state (and optional MongoDB sync)
+- Automatic resume after Ctrl+C via local SQLite state + reliable MongoDB sync
+- Automatic startup backfill of any SQLite-only rows into MongoDB
 - Full file logging (audio_processor.log) without cluttering the live UI
 """
+"""# 1. Backfill any songs already in gmusic_state.db into MongoDB right away
+python main.py --sync-mongo-only
 
+# 2. Run normal processing and fail immediately if MongoDB is not connected
+python main.py --require-mongo"""
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -52,8 +57,11 @@ from rich.table import Table
 
 try:
     from pymongo import ASCENDING, MongoClient
+    from pymongo.errors import PyMongoError
 except ImportError:
+    ASCENDING = 1
     MongoClient = None  # Optional if using local SQLite state only
+    PyMongoError = Exception
 
 SCOPES = [
     # The worker receives a folder ID directly instead of using Google Picker,
@@ -135,6 +143,7 @@ class Config:
     sqlite_path: str
     mongodb_uri: Optional[str]
     mongodb_db_name: str
+    require_mongo: bool
     max_workers: int
     ffmpeg_threads: int
     max_cpu_percent: float
@@ -143,18 +152,33 @@ class Config:
     min_free_disk_mb: int
 
 
+def _first_env(*names: str) -> Optional[str]:
+    for name in names:
+        val = os.getenv(name)
+        if val and val.strip():
+            return val.strip()
+    return None
+
+
 def load_config(args: argparse.Namespace) -> Config:
+    script_dir = Path(__file__).resolve().parent
     repo_root = Path(__file__).resolve().parents[1]
-    load_dotenv(repo_root / ".env")
+    # Load repo root .env first, then script-local .env as fallback without overriding existing vars
+    load_dotenv(repo_root / ".env", override=False)
+    load_dotenv(script_dir / ".env", override=False)
+
     orig_id = os.getenv("GMUSIC_ORIGINAL_FOLDER_ID", "").strip()
     root_id = os.getenv("GMUSIC_ROOT_FOLDER_ID", "").strip() or orig_id
 
-    if not orig_id:
+    if not orig_id and not getattr(args, "sync_mongo_only", False):
         raise ValueError("GMUSIC_ORIGINAL_FOLDER_ID must be set in the repository .env")
 
     workers = args.workers or int(os.getenv("MAX_WORKERS", "3"))
     cpu_cores = os.cpu_count() or 4
     default_ff_threads = max(1, cpu_cores // max(1, workers))
+
+    mongodb_uri = _first_env("MONGO_URI", "MONGODB_URI", "MONGO_URL", "MONGODB_URL")
+    mongodb_db_name = _first_env("MONGO_DB", "MONGODB_DB_NAME", "MONGO_DB_NAME") or "Gmusic"
 
     return Config(
         root_folder_id=root_id,
@@ -167,11 +191,12 @@ def load_config(args: argparse.Namespace) -> Config:
         credentials_path=os.getenv("GOOGLE_CREDENTIALS_PATH")
         or os.getenv("GDRIVE_CREDENTIALS_PATH")
         or str(repo_root / "credentials1.json"),
-        token_path=os.getenv("GOOGLE_TOKEN_PATH", str(Path(__file__).resolve().parent / "token.json")),
+        token_path=os.getenv("GOOGLE_TOKEN_PATH", str(script_dir / "token.json")),
         oauth_local_port=max(1024, min(65535, int(os.getenv("GOOGLE_OAUTH_LOCAL_PORT", "8765")))),
-        sqlite_path=os.getenv("LOCAL_STATE_DB", str(Path(__file__).resolve().parent / "gmusic_state.db")),
-        mongodb_uri=os.getenv("MONGO_URI", "").strip() or os.getenv("MONGODB_URI", "").strip() or None,
-        mongodb_db_name=os.getenv("MONGO_DB", "").strip() or os.getenv("MONGODB_DB_NAME", "Gmusic"),
+        sqlite_path=os.getenv("LOCAL_STATE_DB", str(script_dir / "gmusic_state.db")),
+        mongodb_uri=mongodb_uri,
+        mongodb_db_name=mongodb_db_name,
+        require_mongo=bool(getattr(args, "require_mongo", False)),
         owner_id=os.getenv("GMUSIC_DRIVE_OWNER_ID", "shared").strip() or "shared",
         max_workers=max(1, workers),
         ffmpeg_threads=max(1, args.ffmpeg_threads or int(os.getenv("FFMPEG_THREADS", str(default_ff_threads)))),
@@ -228,23 +253,55 @@ def source_version(md5: Optional[str], modified_time: Optional[str], size: Optio
 
 
 class StateStore:
-    """Thread-safe local SQLite state for instant resume, with optional MongoDB sync."""
+    """Thread-safe local SQLite state for instant resume, with reliable MongoDB sync."""
 
-    def __init__(self, sqlite_path: str, mongodb_uri: Optional[str], mongodb_db_name: str, owner_id: str):
+    def __init__(
+        self,
+        sqlite_path: str,
+        mongodb_uri: Optional[str],
+        mongodb_db_name: str,
+        owner_id: str,
+        require_mongo: bool = False,
+    ):
         self.sqlite_path = sqlite_path
+        self.mongodb_db_name = mongodb_db_name
         self.owner_id = owner_id
         self._lock = threading.Lock()
         self._init_sqlite()
 
+        self.mongo_client = None
         self.mongo_col = None
-        if mongodb_uri and MongoClient is not None:
+        self.mongo_status = "DISABLED"
+
+        if not mongodb_uri:
+            msg = (
+                "MongoDB sync DISABLED: no MONGO_URI / MONGODB_URI / MONGO_URL / MONGODB_URL "
+                "found in environment or .env. Writing to SQLite only."
+            )
+            logger.warning(msg)
+            print(f"WARNING: {msg}", file=sys.stderr)
+            if require_mongo:
+                raise RuntimeError(msg)
+        elif MongoClient is None:
+            msg = (
+                f"MongoDB sync DISABLED: pymongo is not installed in {sys.executable}. "
+                "Run 'pip install pymongo' to enable MongoDB syncing."
+            )
+            logger.warning(msg)
+            print(f"WARNING: {msg}", file=sys.stderr)
+            if require_mongo:
+                raise RuntimeError(msg)
+        else:
             client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=10000)
+            client.admin.command("ping")
+            self.mongo_client = client
             self.mongo_col = client[mongodb_db_name]["quality_renditions"]
             self.mongo_col.create_index(
                 [("ownerId", ASCENDING), ("driveFileId", ASCENDING), ("sourceVersion", ASCENDING), ("quality", ASCENDING)],
                 unique=True,
                 name="uniq_owner_source_quality",
             )
+            self.mongo_status = f"Connected ({mongodb_db_name}.quality_renditions)"
             logger.info("Connected to MongoDB (%s.quality_renditions)", mongodb_db_name)
 
     def _init_sqlite(self) -> None:
@@ -257,6 +314,7 @@ class StateStore:
                     original_filename TEXT,
                     original_md5 TEXT,
                     original_modified TEXT,
+                    source_size INTEGER,
                     actual_bitrate_kbps INTEGER,
                     rendition_drive_id TEXT,
                     rendition_filename TEXT,
@@ -265,11 +323,139 @@ class StateStore:
                     status TEXT NOT NULL,
                     error_message TEXT,
                     processed_at TEXT,
+                    mongo_synced INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (original_id, quality)
                 )
                 """
             )
+            # Migrate existing SQLite databases seamlessly
+            existing_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(renditions)").fetchall()
+            }
+            if "source_size" not in existing_cols:
+                conn.execute("ALTER TABLE renditions ADD COLUMN source_size INTEGER")
+            if "mongo_synced" not in existing_cols:
+                conn.execute("ALTER TABLE renditions ADD COLUMN mongo_synced INTEGER NOT NULL DEFAULT 0")
             conn.commit()
+
+    def _write_mongo_doc(self, doc: Dict[str, Any], retries: int = 3) -> None:
+        if self.mongo_col is None:
+            return
+
+        quality = doc["quality"]
+        version = source_version(
+            doc.get("originalMd5Checksum"),
+            doc.get("originalModifiedTime"),
+            doc.get("sourceSize"),
+        )
+        rendition_id = hashlib.sha256(
+            f"{self.owner_id}\0{doc['originalDriveFileId']}\0{version}\0{quality}".encode("utf-8")
+        ).hexdigest()
+        now = datetime.now(timezone.utc)
+        mongo_doc: Dict[str, Any] = {
+            "ownerId": self.owner_id,
+            "driveFileId": doc["originalDriveFileId"],
+            "sourceVersion": version,
+            "sourceMd5Checksum": doc.get("originalMd5Checksum"),
+            "sourceModifiedTime": doc.get("originalModifiedTime"),
+            "sourceSize": doc.get("sourceSize"),
+            "quality": quality,
+            "targetBitrateKbps": doc.get("targetBitrateKbps", QUALITY_PROFILES[quality]["bitrate_kbps"]),
+            "actualBitrateKbps": doc.get("actualBitrateKbps"),
+            "codec": "mp3",
+            "durationMs": int(float(doc.get("durationSeconds") or 0) * 1000) or None,
+            "fileSize": doc.get("generatedFileSize"),
+            "renditionDriveFileId": doc.get("renditionDriveFileId"),
+            "renditionFilename": doc.get("renditionFilename"),
+            "status": doc["status"],
+            "errorCode": "rendition_generation_failed" if doc.get("status") == "failed" else None,
+            "updatedAt": now,
+        }
+        if doc.get("status") == "ready":
+            mongo_doc["readyAt"] = now
+
+        # Match on the unique compound index so pre-existing docs (e.g. with ObjectId _id)
+        # are updated in place instead of throwing E11000 DuplicateKeyError.
+        unique_filter = {
+            "ownerId": self.owner_id,
+            "driveFileId": doc["originalDriveFileId"],
+            "sourceVersion": version,
+            "quality": quality,
+        }
+
+        delay = 1.0
+        for attempt in range(1, retries + 1):
+            try:
+                self.mongo_col.update_one(
+                    unique_filter,
+                    {"$set": mongo_doc, "$setOnInsert": {"_id": rendition_id, "createdAt": now}},
+                    upsert=True,
+                )
+                return
+            except PyMongoError as exc:
+                if attempt < retries:
+                    logger.warning(
+                        "MongoDB write failed (attempt %d/%d) for %s [%s]: %s",
+                        attempt,
+                        retries,
+                        doc["originalDriveFileId"],
+                        quality,
+                        exc,
+                    )
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    raise
+
+    def sync_unsynced_to_mongo(self) -> int:
+        """Backfill any completed SQLite rows that have not yet been synced to MongoDB."""
+        if self.mongo_col is None:
+            return 0
+
+        with self._lock:
+            with sqlite3.connect(self.sqlite_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT * FROM renditions
+                    WHERE mongo_synced = 0 AND status IN ('ready', 'skipped_no_upscale')
+                    """
+                ).fetchall()
+
+        synced = 0
+        for r in rows:
+            doc = {
+                "originalDriveFileId": r["original_id"],
+                "originalFilename": r["original_filename"],
+                "originalMd5Checksum": r["original_md5"],
+                "originalModifiedTime": r["original_modified"],
+                "sourceSize": r["source_size"],
+                "quality": r["quality"],
+                "targetBitrateKbps": QUALITY_PROFILES[r["quality"]]["bitrate_kbps"],
+                "actualBitrateKbps": r["actual_bitrate_kbps"],
+                "renditionDriveFileId": r["rendition_drive_id"],
+                "renditionFilename": r["rendition_filename"],
+                "generatedFileSize": r["generated_size"],
+                "durationSeconds": r["duration_seconds"],
+                "status": r["status"],
+            }
+            self._write_mongo_doc(doc)
+            with self._lock:
+                with sqlite3.connect(self.sqlite_path) as conn:
+                    conn.execute(
+                        "UPDATE renditions SET mongo_synced = 1 WHERE original_id = ? AND quality = ?",
+                        (r["original_id"], r["quality"]),
+                    )
+                    conn.commit()
+            synced += 1
+
+        if synced:
+            logger.info(
+                "Backfilled %d previously unsynced SQLite rendition(s) to MongoDB (%s.quality_renditions)",
+                synced,
+                self.mongodb_db_name,
+            )
+        return synced
 
     def get_rendition(self, original_id: str, quality: str) -> Optional[Dict[str, Any]]:
         with self._lock:
@@ -293,26 +479,47 @@ class StateStore:
                     "quality": doc.get("quality"),
                     "original_md5": doc.get("sourceMd5Checksum"),
                     "original_modified": doc.get("sourceModifiedTime"),
+                    "source_size": doc.get("sourceSize"),
                     "rendition_drive_id": doc.get("renditionDriveFileId"),
                     "status": doc.get("status"),
+                    "mongo_synced": 1,
                 }
         return None
 
     def upsert_rendition(self, doc: Dict[str, Any]) -> None:
         now_iso = datetime.now(timezone.utc).isoformat()
+        mongo_synced = 0
+        mongo_err: Optional[Exception] = None
+
+        # Write to MongoDB first when enabled so we know whether it actually succeeded
+        if self.mongo_col is not None:
+            try:
+                self._write_mongo_doc(doc)
+                mongo_synced = 1
+            except Exception as exc:
+                mongo_err = exc
+                logger.error(
+                    "MongoDB upsert failed for %s [%s] (will remain mongo_synced=0 in SQLite): %s",
+                    doc["originalDriveFileId"],
+                    doc["quality"],
+                    exc,
+                )
+
         with self._lock:
             with sqlite3.connect(self.sqlite_path) as conn:
                 conn.execute(
                     """
                     INSERT INTO renditions (
                         original_id, quality, original_filename, original_md5, original_modified,
-                        actual_bitrate_kbps, rendition_drive_id, rendition_filename,
-                        generated_size, duration_seconds, status, error_message, processed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        source_size, actual_bitrate_kbps, rendition_drive_id, rendition_filename,
+                        generated_size, duration_seconds, status, error_message, processed_at,
+                        mongo_synced
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(original_id, quality) DO UPDATE SET
                         original_filename=excluded.original_filename,
                         original_md5=excluded.original_md5,
                         original_modified=excluded.original_modified,
+                        source_size=excluded.source_size,
                         actual_bitrate_kbps=excluded.actual_bitrate_kbps,
                         rendition_drive_id=excluded.rendition_drive_id,
                         rendition_filename=excluded.rendition_filename,
@@ -320,7 +527,8 @@ class StateStore:
                         duration_seconds=excluded.duration_seconds,
                         status=excluded.status,
                         error_message=excluded.error_message,
-                        processed_at=excluded.processed_at
+                        processed_at=excluded.processed_at,
+                        mongo_synced=excluded.mongo_synced
                     """,
                     (
                         doc["originalDriveFileId"],
@@ -328,6 +536,7 @@ class StateStore:
                         doc.get("originalFilename"),
                         doc.get("originalMd5Checksum"),
                         doc.get("originalModifiedTime"),
+                        doc.get("sourceSize"),
                         doc.get("actualBitrateKbps"),
                         doc.get("renditionDriveFileId"),
                         doc.get("renditionFilename"),
@@ -336,46 +545,13 @@ class StateStore:
                         doc["status"],
                         doc.get("errorMessage"),
                         now_iso,
+                        mongo_synced,
                     ),
                 )
                 conn.commit()
 
-        if self.mongo_col is not None:
-            version = source_version(
-                doc.get("originalMd5Checksum"),
-                doc.get("originalModifiedTime"),
-                doc.get("sourceSize"),
-            )
-            rendition_id = hashlib.sha256(
-                f"{self.owner_id}\0{doc['originalDriveFileId']}\0{version}\0{doc['quality']}".encode()
-            ).hexdigest()
-            now = datetime.now(timezone.utc)
-            mongo_doc = {
-                "ownerId": self.owner_id,
-                "driveFileId": doc["originalDriveFileId"],
-                "sourceVersion": version,
-                "sourceMd5Checksum": doc.get("originalMd5Checksum"),
-                "sourceModifiedTime": doc.get("originalModifiedTime"),
-                "sourceSize": doc.get("sourceSize"),
-                "quality": doc["quality"],
-                "targetBitrateKbps": doc.get("targetBitrateKbps", QUALITY_PROFILES[doc["quality"]]["bitrate_kbps"]),
-                "actualBitrateKbps": doc.get("actualBitrateKbps"),
-                "codec": "mp3",
-                "durationMs": int(float(doc.get("durationSeconds") or 0) * 1000) or None,
-                "fileSize": doc.get("generatedFileSize"),
-                "renditionDriveFileId": doc.get("renditionDriveFileId"),
-                "renditionFilename": doc.get("renditionFilename"),
-                "status": doc["status"],
-                "errorCode": "rendition_generation_failed" if doc.get("status") == "failed" else None,
-                "updatedAt": now,
-            }
-            if doc.get("status") == "ready":
-                mongo_doc["readyAt"] = now
-            self.mongo_col.update_one(
-                {"_id": rendition_id},
-                {"$set": mongo_doc, "$setOnInsert": {"createdAt": now}},
-                upsert=True,
-            )
+        if mongo_err is not None:
+            raise mongo_err
 
 
 def get_drive_credentials(credentials_path: str, token_path: str, oauth_local_port: int) -> Credentials:
@@ -692,9 +868,10 @@ def is_current(doc: Optional[Dict[str, Any]], md5: Optional[str], mod_time: str)
 class Dashboard:
     """Thread-safe Rich live dashboard showing overall + per-song parallel progress + CPU/RAM."""
 
-    def __init__(self, total_songs: int, limiter: ResourceLimiter, max_workers: int):
+    def __init__(self, total_songs: int, limiter: ResourceLimiter, max_workers: int, mongo_status: str = "DISABLED"):
         self.limiter = limiter
         self.max_workers = max_workers
+        self.mongo_status = mongo_status
         self.stats = {"processed": 0, "skipped": 0, "failed": 0, "total": total_songs}
         self._lock = threading.Lock()
 
@@ -748,6 +925,7 @@ class Dashboard:
 
         cpu_color = "red" if cpu > self.limiter.max_cpu else "green"
         mem_color = "red" if mem > self.limiter.max_mem else "green"
+        mongo_color = "green" if self.mongo_status.startswith("Connected") else "red"
 
         header = Table.grid(expand=True)
         header.add_column(justify="left")
@@ -759,6 +937,10 @@ class Dashboard:
             f"[red]Failed: {s['failed']}[/red]",
             f"[bold]CPU:[/bold] [{cpu_color}]{cpu:4.1f}%[/{cpu_color}] (max {self.limiter.max_cpu:.0f}%)  |  "
             f"[bold]RAM:[/bold] [{mem_color}]{mem:4.1f}%[/{mem_color}] (max {self.limiter.max_mem:.0f}%)",
+        )
+        header.add_row(
+            f"[bold]MongoDB:[/bold] [{mongo_color}]{self.mongo_status}[/{mongo_color}]",
+            "",
         )
 
         body = Group(
@@ -812,19 +994,20 @@ def process_song(
         return "dry_run"
 
     task_id = dashboard.add_song_task(orig_name)
-    if not force:
-        for q in needed:
-            store.upsert_rendition({
-                "originalDriveFileId": orig_id,
-                "originalFilename": orig_name,
-                "originalMd5Checksum": orig_md5,
-                "originalModifiedTime": orig_mod,
-                "sourceSize": orig_size,
-                "quality": q,
-                "status": "pending",
-            })
     work_dir = Path(tempfile.mkdtemp(prefix=f"gmusic_{orig_id[:8]}_"))
     try:
+        if not force:
+            for q in needed:
+                store.upsert_rendition({
+                    "originalDriveFileId": orig_id,
+                    "originalFilename": orig_name,
+                    "originalMd5Checksum": orig_md5,
+                    "originalModifiedTime": orig_mod,
+                    "sourceSize": orig_size,
+                    "quality": q,
+                    "status": "pending",
+                })
+
         # Check disk space
         free_mb = shutil.disk_usage(work_dir).free // (1024 * 1024)
         if free_mb < config.min_free_disk_mb:
@@ -865,7 +1048,7 @@ def process_song(
 
             # Enforce CPU & RAM limits before launching FFmpeg
             limiter.wait_for_headroom(
-                on_throttle=lambda c, m: dashboard.update_song(task_id, f"Wait CPU/RAM", 0.0)
+                on_throttle=lambda c, m: dashboard.update_song(task_id, "Wait CPU/RAM", 0.0)
             )
 
             target_name = f"{orig_id}_{prof['ffmpeg_bitrate']}.mp3"
@@ -939,17 +1122,25 @@ def process_song(
     except Exception as exc:
         logger.error("[ERROR] %s (%s): %s", orig_name, orig_id, exc)
         for q in needed:
-            if not is_current(store.get_rendition(orig_id, q), orig_md5, orig_mod):
-                store.upsert_rendition({
-                    "originalDriveFileId": orig_id,
-                    "originalFilename": orig_name,
-                    "originalMd5Checksum": orig_md5,
-                    "originalModifiedTime": orig_mod,
-                    "sourceSize": orig_size,
-                    "quality": q,
-                    "status": "failed",
-                    "errorMessage": str(exc),
-                })
+            try:
+                if not is_current(store.get_rendition(orig_id, q), orig_md5, orig_mod):
+                    store.upsert_rendition({
+                        "originalDriveFileId": orig_id,
+                        "originalFilename": orig_name,
+                        "originalMd5Checksum": orig_md5,
+                        "originalModifiedTime": orig_mod,
+                        "sourceSize": orig_size,
+                        "quality": q,
+                        "status": "failed",
+                        "errorMessage": str(exc),
+                    })
+            except Exception as state_exc:
+                logger.error(
+                    "[ERROR] Failed to persist failure state for %s [%s]: %s",
+                    orig_name,
+                    q,
+                    state_exc,
+                )
         return "failed"
     finally:
         dashboard.remove_song_task(task_id)
@@ -966,6 +1157,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--file-id", type=str, default=None, help="Process a single Drive file ID")
     p.add_argument("--dry-run", action="store_true", help="Preview what would be processed")
     p.add_argument("--force", action="store_true", help="Regenerate all qualities, preserving existing links until replacement")
+    p.add_argument("--require-mongo", action="store_true", help="Exit immediately if MongoDB is unavailable")
+    p.add_argument("--sync-mongo-only", action="store_true", help="Sync unsynced SQLite rows to MongoDB and exit")
     p.add_argument("--verbose", action="store_true", help="Verbose file logging")
     return p.parse_args()
 
@@ -974,15 +1167,30 @@ def main() -> int:
     args = parse_args()
     setup_logging(verbose=args.verbose)
 
+    config = load_config(args)
+    store = StateStore(
+        config.sqlite_path,
+        config.mongodb_uri,
+        config.mongodb_db_name,
+        config.owner_id,
+        require_mongo=config.require_mongo or args.sync_mongo_only,
+    )
+
+    if store.mongo_col is not None:
+        backfilled = store.sync_unsynced_to_mongo()
+        if backfilled:
+            print(f"Synced {backfilled} previously unsynced rendition(s) from SQLite to MongoDB.")
+
+    if args.sync_mongo_only:
+        return 0
+
     for tool in ("ffmpeg", "ffprobe"):
         if shutil.which(tool) is None:
             print(f"ERROR: '{tool}' not found in PATH. Install FFmpeg first.", file=sys.stderr)
             return 1
 
-    config = load_config(args)
     creds = get_drive_credentials(config.credentials_path, config.token_path, config.oauth_local_port)
     drive = DriveClient(creds)
-    store = StateStore(config.sqlite_path, config.mongodb_uri, config.mongodb_db_name, config.owner_id)
     limiter = ResourceLimiter(config.max_cpu_percent, config.max_mem_percent)
 
     quality_folders = drive.ensure_quality_folders(config.root_folder_id, config.quality_folder_ids)
@@ -990,9 +1198,15 @@ def main() -> int:
     if args.limit and args.limit > 0:
         files = files[: args.limit]
 
-    dashboard = Dashboard(len(files), limiter, config.max_workers)
-    logger.info("Starting run: %d songs, workers=%d, max_cpu=%.0f%%, max_mem=%.0f%%",
-                len(files), config.max_workers, config.max_cpu_percent, config.max_mem_percent)
+    dashboard = Dashboard(len(files), limiter, config.max_workers, mongo_status=store.mongo_status)
+    logger.info(
+        "Starting run: %d songs, workers=%d, max_cpu=%.0f%%, max_mem=%.0f%%, mongo=%s",
+        len(files),
+        config.max_workers,
+        config.max_cpu_percent,
+        config.max_mem_percent,
+        store.mongo_status,
+    )
 
     try:
         with Live(dashboard.render(), refresh_per_second=6) as live:

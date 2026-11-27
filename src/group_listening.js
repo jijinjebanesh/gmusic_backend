@@ -25,6 +25,11 @@ const GROUP_PAUSE_LEAD_MS = 1_500;
 const ROOM_TTL_MS = 24 * 60 * 60_000;
 const MAX_POSITION_MS = 86_400_000;
 const MAX_POSITION_SAMPLE_AGE_MS = 15_000;
+const HOST_DISCONNECT_GRACE_MS = 25_000;
+const READINESS_TIMEOUT_MS = 12_000;
+const MIN_SCHEDULED_LEAD_MS = 1_200;
+const MAX_SCHEDULED_LEAD_MS = 2_500;
+const MAX_PROCESSED_COMMANDS = 200;
 const VALID_AUDIO_CHANNELS = new Set([
   'full',
   'left',
@@ -47,22 +52,14 @@ const CHANNEL_LAYOUT_PRESETS = {
     'surround_right',
   ],
 };
+const PLAYBACK_CONTROL_ACTIONS = new Set([
+  'play', 'pause', 'seek', 'next', 'previous', 'queuePlay', 'queueAdd',
+  'queueRemove', 'queueReorder', 'queueReplace', 'queueClear',
+  'setShuffle', 'setRepeat',
+]);
 const HOST_ONLY_CONTROL_ACTIONS = new Set([
-  'play',
-  'pause',
-  'seek',
-  'next',
-  'previous',
-  'queuePlay',
-  'queueReplace',
-  'queueRemove',
-  'queueReorder',
-  'queueClear',
-  'setChannel',
-  'setChannelLayout',
-  'setShuffle',
-  'setRepeat',
-  'end',
+  'setAllowListenerControl', 'setMemberControl', 'transferHost',
+  'setChannel', 'setChannelLayout', 'end',
 ]);
 
 function apiError(status, code) {
@@ -75,6 +72,12 @@ function requirePersonalAccount(req, res) {
     return false;
   }
   return true;
+}
+
+function hasPlaybackControl(room, member) {
+  return member.memberId === room.hostMemberId ||
+    room.allowListenerControl === true ||
+    member.canControlPlayback === true;
 }
 
 function validateQueue(trackIds, index = 0, positionMs = 0) {
@@ -98,11 +101,16 @@ function roomPosition(room, time) {
   if (!room.playing || room.status === 'preparing') {
     return room.positionMs || 0;
   }
-  const anchor = room.startAtServerTime
-    ? new Date(room.startAtServerTime).getTime()
-    : new Date(room.updatedAt || time).getTime();
-  const elapsed = Math.max(0, time.getTime() - anchor);
-  const position = (room.positionMs || 0) + elapsed;
+  const anchorPosition = Number.isSafeInteger(room.anchorPositionMs)
+    ? room.anchorPositionMs
+    : (room.positionMs || 0);
+  const anchorTime = Number.isSafeInteger(room.anchorServerTimeMs)
+    ? room.anchorServerTimeMs
+    : (room.startAtServerTime
+      ? new Date(room.startAtServerTime).getTime()
+      : new Date(room.updatedAt || time).getTime());
+  const elapsed = Math.max(0, time.getTime() - anchorTime);
+  const position = anchorPosition + elapsed * (room.playbackRate || 1);
   return Math.min(
     MAX_POSITION_MS,
     room.durationMs > 0 ? Math.min(position, room.durationMs) : position,
@@ -130,6 +138,7 @@ function publicRoom(room, time, userId = null) {
     sessionId: String(room._id),
     invitationCode: room.code,
     title: room.title,
+    allowListenerControl: room.allowListenerControl === true,
     hostMemberId: room.hostMemberId,
     hostDeviceId: room.hostDeviceId,
     status,
@@ -138,9 +147,27 @@ function publicRoom(room, time, userId = null) {
     positionMs,
     durationMs: room.durationMs || 0,
     playing: room.playing === true,
+    anchorPositionMs: Number.isSafeInteger(room.anchorPositionMs)
+      ? room.anchorPositionMs
+      : positionMs,
+    anchorServerTimeMs: Number.isSafeInteger(room.anchorServerTimeMs)
+      ? room.anchorServerTimeMs
+      : (room.startAtServerTime
+        ? new Date(room.startAtServerTime).getTime()
+        : time.getTime()),
+    playbackRate: room.playbackRate || 1,
+    pauseAtServerTimeMs: Number.isSafeInteger(room.pauseAtServerTimeMs)
+      ? room.pauseAtServerTimeMs
+      : null,
+    pausePositionMs: Number.isSafeInteger(room.pausePositionMs)
+      ? room.pausePositionMs
+      : null,
     startAtServerTime: room.startAtServerTime || null,
     stateVersion: room.stateVersion || 0,
+    membersRevision: room.membersRevision || 0,
     queueRevision: room.queueRevision || 0,
+    lastControlActorMemberId: room.lastControlActorMemberId || null,
+    lastControlAction: room.lastControlAction || null,
     channelLayout: room.channelLayout || 'all_stereo',
     shuffle: room.shuffle === true,
     repeat: ['one', 'all'].includes(room.repeat) ? room.repeat : 'none',
@@ -158,7 +185,10 @@ function publicRoom(room, time, userId = null) {
       name: member.name,
       platform: member.platform,
       isHost: member.memberId === room.hostMemberId,
-      canControlPlayback: member.userId === room.hostUserId,
+      canControlPlayback:
+        member.memberId === room.hostMemberId ||
+        room.allowListenerControl === true ||
+        member.canControlPlayback === true,
       online: isOnline(member, time),
       ready: isReady(member, time),
       driftMs: Number.isFinite(member.driftMs) ? member.driftMs : null,
@@ -193,6 +223,21 @@ async function refreshHost(groups, room, time) {
   const members = room.members || [];
   const host = members.find((member) => member.memberId === room.hostMemberId);
   if (host && isOnline(host, time)) return room;
+  if (host) {
+    const offlineAt = host.hostOfflineAt
+      ? new Date(host.hostOfflineAt).getTime()
+      : time.getTime();
+    if (!host.hostOfflineAt) {
+      return updateRoom(groups, room._id, (current) => ({
+        ...current,
+        members: current.members.map((item) =>
+          item.memberId === host.memberId
+            ? { ...item, hostOfflineAt: time }
+            : item),
+      }), time);
+    }
+    if (time.getTime() - offlineAt < HOST_DISCONNECT_GRACE_MS) return room;
+  }
   const online = members
     .filter((member) => isOnline(member, time))
     .sort((left, right) =>
@@ -282,17 +327,32 @@ function readyMembers(room, time) {
   // In a multi-member room, don't schedule until at least 2 members are online
   // and ready.  A solo room (single member total) can still start immediately.
   if ((room.members || []).length > 1 && active.length < 2) return false;
-  return active.every((member) => isReady(member, time));
+  return active.every((member) =>
+    member.needsCatchUp === true || isReady(member, time));
 }
 
 function scheduleIfReady(room, time) {
   if (room.status !== 'preparing' || !room.playing || !readyMembers(room, time)) {
     return room;
   }
+  const maxLatency = (room.members || []).reduce((maximum, member) => {
+    if (!isOnline(member, time)) return maximum;
+    return Math.max(maximum, Number.isFinite(member.latencyCompensationMs)
+      ? Math.abs(member.latencyCompensationMs)
+      : 0);
+  }, 0);
+  const leadTimeMs = Math.min(
+    MAX_SCHEDULED_LEAD_MS,
+    Math.max(MIN_SCHEDULED_LEAD_MS, 1_200 + maxLatency),
+  );
+  const anchorServerTimeMs = time.getTime() + leadTimeMs;
   return {
     ...room,
     status: 'scheduled',
-    startAtServerTime: new Date(time.getTime() + 3_000).toISOString(),
+    startAtServerTime: new Date(anchorServerTimeMs).toISOString(),
+    anchorPositionMs: room.positionMs || 0,
+    anchorServerTimeMs,
+    playbackRate: 1,
   };
 }
 
@@ -308,6 +368,7 @@ function emitParticipants(room, time) {
   publishGroupEvent(String(room._id), {
     type: 'participants',
     sessionId: String(room._id),
+    membersRevision: publicState.membersRevision,
     participants: publicState.members,
     serverTime: time.toISOString(),
   });
@@ -328,6 +389,8 @@ function createMember(req, device, time) {
     driftMs: null,
     clockOffsetMs: 0,
     latencyCompensationMs: 0,
+    canControlPlayback: false,
+    audioChannel: 'full',
   };
 }
 
@@ -348,6 +411,19 @@ export function createGroupListeningRouter({
 } = {}) {
   const router = express.Router();
   const groups = () => collection('group_listening_sessions');
+  const joinAttempts = new Map();
+
+  router.get('/group-listening/clock', (req, res) => {
+    const t0 = Number(req.query.clientSendMs);
+    const t1 = Date.now();
+    const t2 = Date.now();
+    res.json({
+      ok: true,
+      t0: Number.isSafeInteger(t0) ? t0 : null,
+      t1,
+      t2,
+    });
+  });
 
   router.post('/group-listening', async (req, res, next) => {
     if (!requirePersonalAccount(req, res)) return;
@@ -359,6 +435,7 @@ export function createGroupListeningRouter({
       const index = req.body?.index ?? 0;
       const positionMs = req.body?.positionMs ?? 0;
       const durationMs = req.body?.durationMs ?? 0;
+      const allowListenerControl = req.body?.allowListenerControl === true;
       if (!title || title.length > 80) throw apiError(400, 'invalid_group_title');
       validateQueue(trackIds, index, positionMs);
       if (!Number.isSafeInteger(durationMs) || durationMs < 0 ||
@@ -410,6 +487,14 @@ export function createGroupListeningRouter({
           hostUserId: req.user.id,
           hostDeviceId: deviceId,
           hostMemberId: member.memberId,
+          allowListenerControl,
+          membersRevision: 1,
+          playbackRate: 1,
+          anchorPositionMs: positionMs,
+          anchorServerTimeMs: time.getTime(),
+          pauseAtServerTimeMs: null,
+          pausePositionMs: null,
+          processedCommands: [],
           status: 'paused',
           trackIds,
           index,
@@ -456,6 +541,17 @@ export function createGroupListeningRouter({
     if (!requirePersonalAccount(req, res)) return;
     try {
       const time = now();
+      const accountKey = String(req.user?.id || 'unknown');
+      const ip = String(req.ip || req.headers['x-forwarded-for'] || 'unknown');
+      const rateKey = `${accountKey}:${ip}`;
+      const cutoff = time.getTime() - 10 * 60_000;
+      const attempts = (joinAttempts.get(rateKey) || []).filter((value) =>
+        value >= cutoff);
+      attempts.push(time.getTime());
+      joinAttempts.set(rateKey, attempts);
+      if (attempts.length > 30) {
+        throw apiError(429, 'group_join_rate_limited');
+      }
       const code = String(req.body?.invitationCode || '')
         .trim().toUpperCase();
       const deviceId = String(req.body?.deviceId || '');
@@ -483,7 +579,23 @@ export function createGroupListeningRouter({
           collection,
           now,
         });
-        res.json({ room: publicRoom(room, time, req.user.id) });
+        const updated = await updateRoom(groups(), room._id, (current) => ({
+          ...current,
+          membersRevision: (current.membersRevision || 0) + 1,
+          members: current.members.map((item) =>
+            item.memberId === existing.memberId
+              ? {
+                  ...item,
+                  lastSeenAt: time,
+                  ready: false,
+                  readyAt: null,
+                  needsCatchUp: current.playing === true,
+                  hostOfflineAt: null,
+                }
+              : item),
+        }), time);
+        emitParticipants(updated, time);
+        res.json({ room: publicRoom(updated, time, req.user.id), rejoined: true });
         return;
       }
       if ((room.members || []).length >= MAX_MEMBERS) {
@@ -502,6 +614,7 @@ export function createGroupListeningRouter({
       try {
         const updated = await updateRoom(groups(), room._id, (current) => ({
           ...current,
+          membersRevision: (current.membersRevision || 0) + 1,
           members: [
             ...current.members,
             member,
@@ -709,6 +822,22 @@ export function createGroupListeningRouter({
             next = { ...next, status: 'playing' };
           }
         }
+        if (next.status === 'preparing' &&
+            time.getTime() - new Date(next.updatedAt || time).getTime() >=
+              READINESS_TIMEOUT_MS) {
+          next = {
+            ...next,
+            members: next.members.map((item) =>
+              isReady(item, time)
+                ? item
+                : {
+                    ...item,
+                    needsCatchUp: true,
+                    ready: false,
+                    readyAt: null,
+                  }),
+          };
+        }
         return scheduleIfReady(next, time);
       }, time);
       if (updated.status !== room.status || updated.index !== room.index ||
@@ -733,13 +862,31 @@ export function createGroupListeningRouter({
       const time = now();
       const deviceId = String(req.body?.deviceId || '');
       const action = String(req.body?.action || '');
+      const suppliedCommandId = String(req.body?.commandId || '');
+      const commandId = /^[A-Za-z0-9_-]{16,128}$/.test(suppliedCommandId)
+        ? suppliedCommandId
+        : crypto.randomUUID();
       const { room, member } = await requireMember(
         groups(), req.params.sessionId, req.user.id, deviceId, time,
       );
+      const duplicate = (room.processedCommands || []).find(
+        (entry) => entry.commandId === commandId,
+      );
+      if (duplicate?.room) {
+        res.json({
+          room: publicRoom(duplicate.room, time, req.user.id),
+          actorMemberId: duplicate.actorMemberId,
+          duplicate: true,
+        });
+        return;
+      }
       if (HOST_ONLY_CONTROL_ACTIONS.has(action) &&
-          member.memberId !== room.hostMemberId &&
-          member.userId !== room.hostUserId) {
-        throw apiError(403, 'group_host_required');
+          member.memberId !== room.hostMemberId) {
+        throw apiError(403, 'forbidden_playback_control');
+      }
+      if (PLAYBACK_CONTROL_ACTIONS.has(action) &&
+          !hasPlaybackControl(room, member)) {
+        throw apiError(403, 'forbidden_playback_control');
       }
       let addedTrackId = null;
       let replacementTrackIds = null;
@@ -767,11 +914,18 @@ export function createGroupListeningRouter({
           getAccessibleTracks,
         );
       }
-      const updated = await updateRoom(groups(), room._id, (current) => {
+      const mutated = await updateRoom(groups(), room._id, (current) => {
+        const currentMember = (current.members || []).find(
+          (item) => item.memberId === member.memberId,
+        );
+        if (!currentMember) throw apiError(403, 'not_a_group_member');
         if (HOST_ONLY_CONTROL_ACTIONS.has(action) &&
-            member.memberId !== current.hostMemberId &&
-            member.userId !== current.hostUserId) {
-          throw apiError(403, 'group_host_required');
+            currentMember.memberId !== current.hostMemberId) {
+          throw apiError(403, 'forbidden_playback_control');
+        }
+        if (PLAYBACK_CONTROL_ACTIONS.has(action) &&
+            !hasPlaybackControl(current, currentMember)) {
+          throw apiError(403, 'forbidden_playback_control');
         }
         const currentPosition = roomPosition(current, time);
         switch (action) {
@@ -789,14 +943,19 @@ export function createGroupListeningRouter({
               const pauseAt = new Date(time.getTime() + GROUP_PAUSE_LEAD_MS);
               const positionMs = roomPosition(current, time) +
                 GROUP_PAUSE_LEAD_MS;
+              const pausePositionMs = current.durationMs > 0
+                ? Math.min(positionMs, current.durationMs)
+                : positionMs;
               return {
                 ...current,
                 playing: false,
                 status: 'paused',
-                positionMs: current.durationMs > 0
-                  ? Math.min(positionMs, current.durationMs)
-                  : positionMs,
+                positionMs: pausePositionMs,
                 startAtServerTime: pauseAt.toISOString(),
+                anchorPositionMs: pausePositionMs,
+                anchorServerTimeMs: pauseAt.getTime(),
+                pauseAtServerTimeMs: pauseAt.getTime(),
+                pausePositionMs,
               };
             }
           case 'seek': {
@@ -809,6 +968,10 @@ export function createGroupListeningRouter({
               ...current,
               positionMs,
               startAtServerTime: null,
+              anchorPositionMs: positionMs,
+              anchorServerTimeMs: time.getTime(),
+              pauseAtServerTimeMs: null,
+              pausePositionMs: null,
               status: current.playing ? 'preparing' : 'paused',
               members: current.members.map((item) => ({
                 ...item,
@@ -964,6 +1127,50 @@ export function createGroupListeningRouter({
               queueRevision: (current.queueRevision || 0) + 1,
             };
           }
+          case 'setAllowListenerControl': {
+            if (typeof req.body?.enabled !== 'boolean') {
+              throw apiError(400, 'invalid_group_command');
+            }
+            return {
+              ...current,
+              allowListenerControl: req.body.enabled,
+              membersRevision: (current.membersRevision || 0) + 1,
+            };
+          }
+          case 'setMemberControl': {
+            const targetMemberId = String(req.body?.memberId || '');
+            if (!targetMemberId ||
+                typeof req.body?.canControl !== 'boolean') {
+              throw apiError(400, 'invalid_group_command');
+            }
+            const exists = (current.members || []).some(
+              (item) => item.memberId === targetMemberId,
+            );
+            if (!exists) throw apiError(404, 'group_member_not_found');
+            return {
+              ...current,
+              membersRevision: (current.membersRevision || 0) + 1,
+              members: (current.members || []).map((item) =>
+                item.memberId === targetMemberId
+                  ? { ...item, canControlPlayback: req.body.canControl }
+                  : item),
+            };
+          }
+          case 'transferHost': {
+            const targetMemberId = String(req.body?.memberId || '');
+            const target = (current.members || []).find(
+              (item) => item.memberId === targetMemberId &&
+                isOnline(item, time),
+            );
+            if (!target) throw apiError(404, 'group_member_not_found');
+            return {
+              ...current,
+              hostMemberId: target.memberId,
+              hostUserId: target.userId,
+              hostDeviceId: target.deviceId,
+              membersRevision: (current.membersRevision || 0) + 1,
+            };
+          }
           case 'setChannel': {
             const targetMemberId = String(req.body?.memberId || '');
             const channel = String(req.body?.channel || '');
@@ -1055,6 +1262,23 @@ export function createGroupListeningRouter({
             throw apiError(400, 'invalid_group_command');
         }
       }, time);
+      const updatedWithControl = await updateRoom(groups(), mutated._id, (current) => ({
+        ...current,
+        lastControlActorMemberId: member.memberId,
+        lastControlAction: action,
+        processedCommands: [
+          ...((current.processedCommands || []).filter(
+            (entry) => entry.commandId !== commandId,
+          )).slice(-(MAX_PROCESSED_COMMANDS - 1)),
+          {
+            commandId,
+            actorMemberId: member.memberId,
+            room: current,
+            createdAt: time,
+          },
+        ],
+      }), time);
+      const updated = updatedWithControl;
       if (updated.status === 'ended') {
         await Promise.all(updated.members.map((item) =>
           releasePlaybackDeviceFromGroup({
@@ -1247,7 +1471,7 @@ export function attachGroupListeningSocketHandlers(
       }
     });
 
-    socket.on('group:clock', (_raw, callback) => {
+    socket.on('group:clock', (raw, callback) => {
       if (!rateLimit() || !socket.data.deviceId) {
         if (typeof callback === 'function') {
           callback({
@@ -1258,7 +1482,16 @@ export function attachGroupListeningSocketHandlers(
         return;
       }
       if (typeof callback === 'function') {
-        callback({ ok: true, serverTime: now().toISOString() });
+        const t1 = Date.now();
+        const t0 = Number(raw?.clientSendMs);
+        const t2 = Date.now();
+        callback({
+          ok: true,
+          t0: Number.isSafeInteger(t0) ? t0 : null,
+          t1,
+          t2,
+          serverTime: new Date(t2).toISOString(),
+        });
       }
     });
   });

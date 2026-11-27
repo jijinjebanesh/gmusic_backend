@@ -24,7 +24,6 @@ OAuth client secret anywhere but this service.
 | `POST /api/v1/drive/sync` | Runs one bounded full-index or incremental-change batch |
 | `GET /api/v1/catalog/tracks` · `GET /api/v1/catalog/tracks/:id` | Paginated indexed tracks with normalized tags, stream URLs, and browser-safe artwork URLs |
 | `POST /api/v1/catalog/tracks/resolve` | Resolves up to 500 track IDs for playback handoff |
-| `GET /api/v1/catalog/tracks/:id/lyrics` | Embedded lyrics from indexed audio tags; returns `lyrics_not_found` when absent |
 | `GET /api/v1/tracks/:id/quality/:quality` | Resolves `original`, `low`, `medium`, or `high`; pre-generated qualities return `202` while the laptop worker is processing |
 | `GET /api/v1/renditions/:jobId` | Authenticated laptop-worker status; returns a stream URL after a Drive rendition is uploaded and recorded |
 | `GET /api/v1/playback/state` · `POST /api/v1/playback/poll` | Account-scoped device registry and versioned playback session |
@@ -41,13 +40,18 @@ OAuth client secret anywhere but this service.
 | `GET /api/v1/albums` · `GET /api/v1/albums/:id/*` | Indexed album aggregates and ordered tracks |
 | `GET /api/v1/genres` · `GET /api/v1/genres/:id/tracks` | Indexed genres and matching tracks |
 | `GET /api/v1/search` | Indexed track, artist and album search |
-| `GET /stream/:ticket` · `GET /art/:ticket` | short-lived original audio / cover-art tickets (no auth header, usable by `<img>` and the player) |
+| `GET /stream/:ticket` · `GET /art/:ticket?quality=:quality` | short-lived original audio / cover-art tickets; artwork uses a ready rendition for the selected quality and falls back to the original |
 | `GET /stream-quality/:ticket` | short-lived ticketed Google Drive MP3 rendition stream with byte-range and HEAD support |
 | `GET/PUT/DELETE /api/v1/favorites/:trackId` · `GET/POST /api/v1/recent` | per-user likes and listening history in Atlas |
+| `GET /api/v1/home` | ID-based quick picks, listening shelves, daily mixes and monthly recap |
+| `POST /api/v1/listening-events` | Records a qualified listen (30 seconds or half the duration) or skip from the active playback device; event IDs deduplicate handoffs |
 | `GET/POST/DELETE /api/v1/search-history` · `DELETE /api/v1/search-history/:query` | per-user, bounded, de-duplicated search history |
 | `GET/PUT/DELETE /api/v1/followed-artists/:artistId` | per-user followed artists |
 | `GET/PUT/DELETE /api/v1/saved-albums/:albumId` | per-user saved albums |
 | `GET/POST/PUT/DELETE /api/v1/playlists` | per-user playlists with ordered track IDs and descriptions |
+
+The Flutter client fetches plain and synced lyrics exclusively from LRCLIB.
+Embedded audio-tag lyrics are neither indexed nor served by the backend.
 
 Every `/api/v1` call other than `auth/*` requires `Authorization: Bearer
 <session token or MORNYE_API_TOKEN>`. Scopes are read-only
@@ -99,7 +103,11 @@ source, not the requesting controller. A failed transfer leaves the source
 active. Queue revisions reject stale queue operations and prevent transfers
 from switching the active owner to a stale queue. A non-owner controller's
 revision is advisory; the transfer uses the current server session. Queues are
-capped at 500 tracks.
+capped at 500 tracks. Commands carry the expected playback revision, while
+queue edits also carry the queue revision. `setQuality` accepts `low`, `medium`,
+`high`, or `original`; the active player reports the selected quality in its
+next playback snapshot. Device records expire 30 days after their last
+heartbeat; the Flutter device list groups offline devices by the 14-day mark.
 
 Group Listening is separate from the account-level Connected Playback session.
 Rooms have their own shared queue and timeline, support up to 20 participants,
@@ -236,8 +244,10 @@ Before the first run, add `http://localhost:8765/` to the web OAuth client's
 authorized redirect URIs in Google Cloud. The first run opens Google OAuth
 consent and stores the worker token beside the script. Review the dry run
 before starting the full library; use `--workers` and `--max-cpu` to tune
-laptop load. Generated files appear in the three quality folders under
-`Music `.
+laptop load. Use `--force` to regenerate every quality. During a forced
+refresh, existing rendition records remain ready and keep their Drive links
+until the replacement upload completes. Generated files appear in the three
+quality folders under `Music `.
 
 The common Drive's initial index is resumable and processes a bounded metadata
 page per `POST /api/v1/drive/sync` call. On an always-on Node deployment, the

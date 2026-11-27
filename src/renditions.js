@@ -114,6 +114,30 @@ export function createRenditionService({
     return doc ? publicRendition(doc, jobId) : null;
   }
 
+  async function artworkSource({ ownerId, trackId, drive, quality }) {
+    if (!RENDITION_QUALITIES[quality] || !isMongoEnabled()) {
+      return { fileId: trackId, revision: null };
+    }
+
+    const source = await drive.getFileMetadata(trackId);
+    const version = sourceVersion(source);
+    const doc = await collection('quality_renditions').findOne({
+      ownerId,
+      driveFileId: trackId,
+      sourceVersion: version,
+      quality,
+    });
+    if (doc?.status !== 'ready' || !doc.renditionDriveFileId) {
+      return { fileId: trackId, revision: null };
+    }
+    return {
+      fileId: doc.renditionDriveFileId,
+      revision: doc.updatedAt instanceof Date
+        ? doc.updatedAt.getTime().toString()
+        : String(doc.updatedAt || ''),
+    };
+  }
+
   async function open({ drive, renditionDriveFileId, fileSize, range }) {
     const selected = parseByteRange(range, fileSize);
     if (selected?.invalid) {
@@ -168,5 +192,5 @@ export function createRenditionService({
     };
   }
 
-  return { prepare, status, open, head };
+  return { prepare, status, artworkSource, open, head };
 }

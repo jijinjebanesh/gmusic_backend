@@ -116,3 +116,76 @@ test('missing and no-upscale variants have explicit non-ready states', async () 
   assert.equal(result.status, 'failed');
   assert.equal(result.error, 'quality_unavailable_for_source');
 });
+
+test('artwork uses only a ready rendition for the current source version', async () => {
+  const docs = new MemoryCollection();
+  const collection = () => docs;
+  const file = {
+    id: 'source-id',
+    md5Checksum: 'md5',
+    size: '99',
+    modifiedTime: 'now',
+  };
+  const version = sourceVersion(file);
+  const readyId = renditionId('shared', file.id, version, 'high');
+  docs.documents.set(readyId, {
+    _id: readyId,
+    ownerId: 'shared',
+    driveFileId: file.id,
+    sourceVersion: version,
+    quality: 'high',
+    status: 'ready',
+    renditionDriveFileId: 'ready-rendition',
+    updatedAt: new Date('2026-01-01T00:00:00Z'),
+  });
+  const service = createRenditionService({ collection, isMongoEnabled: () => true });
+  const drive = { getFileMetadata: async () => file };
+
+  assert.deepEqual(await service.artworkSource({
+    ownerId: 'shared', trackId: file.id, drive, quality: 'high',
+  }), {
+    fileId: 'ready-rendition',
+    revision: String(new Date('2026-01-01T00:00:00Z').getTime()),
+  });
+  assert.deepEqual(await service.artworkSource({
+    ownerId: 'shared', trackId: file.id, drive, quality: 'medium',
+  }), { fileId: file.id, revision: null });
+  docs.documents.set('no-upscale-rendition', {
+    ownerId: 'shared',
+    driveFileId: file.id,
+    sourceVersion: version,
+    quality: 'low',
+    status: 'skipped_no_upscale',
+    renditionDriveFileId: 'not-ready-rendition',
+  });
+  assert.deepEqual(await service.artworkSource({
+    ownerId: 'shared', trackId: file.id, drive, quality: 'low',
+  }), { fileId: file.id, revision: null });
+  docs.documents.set('processing-rendition', {
+    ownerId: 'shared',
+    driveFileId: file.id,
+    sourceVersion: version,
+    quality: 'medium',
+    status: 'processing',
+    renditionDriveFileId: 'not-ready-rendition',
+  });
+  assert.deepEqual(await service.artworkSource({
+    ownerId: 'shared', trackId: file.id, drive, quality: 'medium',
+  }), { fileId: file.id, revision: null });
+  assert.deepEqual(await service.artworkSource({
+    ownerId: 'shared',
+    trackId: file.id,
+    drive: { getFileMetadata: async () => ({ ...file, md5Checksum: 'changed' }) },
+    quality: 'high',
+  }), { fileId: file.id, revision: null });
+  assert.deepEqual(await service.artworkSource({
+    ownerId: 'shared', trackId: file.id, drive, quality: 'original',
+  }), { fileId: file.id, revision: null });
+  const withoutMongo = createRenditionService({
+    collection,
+    isMongoEnabled: () => false,
+  });
+  assert.deepEqual(await withoutMongo.artworkSource({
+    ownerId: 'shared', trackId: file.id, drive, quality: 'high',
+  }), { fileId: file.id, revision: null });
+});

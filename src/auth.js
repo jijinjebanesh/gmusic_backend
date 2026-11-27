@@ -8,6 +8,7 @@ import { ObjectId } from 'mongodb';
 import { getAuth } from 'firebase-admin/auth';
 import { getApps, initializeApp } from 'firebase-admin/app';
 import { col, mongoEnabled } from './db.js';
+import { cleanupPlaybackDeviceOnLogout } from './playback.js';
 
 const SESSION_DAYS = 30;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -227,10 +228,39 @@ export function attachUser(apiToken) {
   };
 }
 
+export async function logoutSession({
+  bearer,
+  deviceId,
+  collection = col,
+  now = () => new Date(),
+} = {}) {
+  if (!bearer) return;
+  const filter = { tokenHash: tokenHash(bearer) };
+  const session = await collection('sessions').findOne(filter);
+  let cleanupError;
+  if (session && typeof deviceId === 'string' && deviceId.trim()) {
+    try {
+      await cleanupPlaybackDeviceOnLogout({
+        userId: String(session.userId),
+        deviceId: deviceId.trim(),
+        collection,
+        now,
+      });
+    } catch (error) {
+      cleanupError = error;
+    }
+  }
+  await collection('sessions').deleteOne(filter);
+  if (cleanupError) throw cleanupError;
+}
+
 authRoutes.post('/logout', async (req, res) => {
   try {
     const bearer = String(req.get('authorization') || '').replace(/^Bearer /i, '');
-    if (bearer) await col('sessions').deleteOne({ tokenHash: tokenHash(bearer) });
+    await logoutSession({
+      bearer,
+      deviceId: req.body?.deviceId,
+    });
     res.json({ ok: true });
   } catch (err) { branch(res); }
 });

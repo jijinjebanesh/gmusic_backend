@@ -303,6 +303,16 @@ function emitRoom(room, time) {
   });
 }
 
+function emitParticipants(room, time) {
+  const publicState = publicRoom(room, time);
+  publishGroupEvent(String(room._id), {
+    type: 'participants',
+    sessionId: String(room._id),
+    participants: publicState.members,
+    serverTime: time.toISOString(),
+  });
+}
+
 function createMember(req, device, time) {
   return {
     memberId: crypto.randomUUID(),
@@ -497,7 +507,7 @@ export function createGroupListeningRouter({
             member,
           ],
         }), time);
-        emitRoom(updated, time);
+        emitParticipants(updated, time);
         res.status(201).json({ room: publicRoom(updated, time, req.user.id) });
       } catch (error) {
         await releasePlaybackDeviceFromGroup({

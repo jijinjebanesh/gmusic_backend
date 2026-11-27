@@ -778,6 +778,7 @@ def process_song(
     limiter: ResourceLimiter,
     dashboard: Dashboard,
     dry_run: bool = False,
+    force: bool = False,
 ) -> str:
     if STOP_EVENT.is_set():
         return "interrupted"
@@ -796,7 +797,12 @@ def process_song(
         logger.warning("Skipping 0-byte file: %s (%s)", orig_name, orig_id)
         return "failed"
 
-    needed = [q for q in ("low", "medium", "high") if not is_current(store.get_rendition(orig_id, q), orig_md5, orig_mod)]
+    qualities = ("low", "medium", "high")
+    current_renditions = {q: store.get_rendition(orig_id, q) for q in qualities}
+    needed = [
+        q for q in qualities
+        if force or not is_current(current_renditions[q], orig_md5, orig_mod)
+    ]
     if not needed:
         logger.info("[SKIP] Already complete: %s (%s)", orig_name, orig_id)
         return "skipped_current"
@@ -806,16 +812,17 @@ def process_song(
         return "dry_run"
 
     task_id = dashboard.add_song_task(orig_name)
-    for q in needed:
-        store.upsert_rendition({
-            "originalDriveFileId": orig_id,
-            "originalFilename": orig_name,
-            "originalMd5Checksum": orig_md5,
-            "originalModifiedTime": orig_mod,
-            "sourceSize": orig_size,
-            "quality": q,
-            "status": "pending",
-        })
+    if not force:
+        for q in needed:
+            store.upsert_rendition({
+                "originalDriveFileId": orig_id,
+                "originalFilename": orig_name,
+                "originalMd5Checksum": orig_md5,
+                "originalModifiedTime": orig_mod,
+                "sourceSize": orig_size,
+                "quality": q,
+                "status": "pending",
+            })
     work_dir = Path(tempfile.mkdtemp(prefix=f"gmusic_{orig_id[:8]}_"))
     try:
         # Check disk space
@@ -842,17 +849,18 @@ def process_song(
 
             if not is_lossless and src_br and src_br <= target_kbps:
                 logger.info("[NO-UPSCALE] %s (%s) source is %dkbps; skipping %s", orig_name, orig_id, src_br, q)
-                store.upsert_rendition({
-                    "originalDriveFileId": orig_id,
-                    "originalFilename": orig_name,
-                    "originalMd5Checksum": orig_md5,
-                    "originalModifiedTime": orig_mod,
-                    "sourceSize": orig_size,
-                    "quality": q,
-                    "actualBitrateKbps": src_br,
-                    "targetBitrateKbps": target_kbps,
-                    "status": "skipped_no_upscale",
-                })
+                if not (force and is_current(current_renditions[q], orig_md5, orig_mod)):
+                    store.upsert_rendition({
+                        "originalDriveFileId": orig_id,
+                        "originalFilename": orig_name,
+                        "originalMd5Checksum": orig_md5,
+                        "originalModifiedTime": orig_mod,
+                        "sourceSize": orig_size,
+                        "quality": q,
+                        "actualBitrateKbps": src_br,
+                        "targetBitrateKbps": target_kbps,
+                        "status": "skipped_no_upscale",
+                    })
                 continue
 
             # Enforce CPU & RAM limits before launching FFmpeg
@@ -863,16 +871,17 @@ def process_song(
             target_name = f"{orig_id}_{prof['ffmpeg_bitrate']}.mp3"
             local_out = work_dir / target_name
 
-            store.upsert_rendition({
-                "originalDriveFileId": orig_id,
-                "originalFilename": orig_name,
-                "originalMd5Checksum": orig_md5,
-                "originalModifiedTime": orig_mod,
-                "sourceSize": orig_size,
-                "quality": q,
-                "targetBitrateKbps": target_kbps,
-                "status": "processing",
-            })
+            if not force:
+                store.upsert_rendition({
+                    "originalDriveFileId": orig_id,
+                    "originalFilename": orig_name,
+                    "originalMd5Checksum": orig_md5,
+                    "originalModifiedTime": orig_mod,
+                    "sourceSize": orig_size,
+                    "quality": q,
+                    "targetBitrateKbps": target_kbps,
+                    "status": "processing",
+                })
 
             stage_enc = f"FFmpeg {prof['ffmpeg_bitrate']}"
             dashboard.update_song(task_id, stage_enc, 0.0)
@@ -956,6 +965,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=None, help="Process only the first N songs")
     p.add_argument("--file-id", type=str, default=None, help="Process a single Drive file ID")
     p.add_argument("--dry-run", action="store_true", help="Preview what would be processed")
+    p.add_argument("--force", action="store_true", help="Regenerate all qualities, preserving existing links until replacement")
     p.add_argument("--verbose", action="store_true", help="Verbose file logging")
     return p.parse_args()
 
@@ -998,7 +1008,16 @@ def main() -> int:
             with ThreadPoolExecutor(max_workers=config.max_workers, thread_name_prefix="SongWorker") as pool:
                 futures = [
                     pool.submit(
-                        process_song, f, drive, store, quality_folders, config, limiter, dashboard, args.dry_run
+                        process_song,
+                        f,
+                        drive,
+                        store,
+                        quality_folders,
+                        config,
+                        limiter,
+                        dashboard,
+                        dry_run=args.dry_run,
+                        force=args.force,
                     )
                     for f in files
                 ]

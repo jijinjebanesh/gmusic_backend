@@ -13,6 +13,7 @@ import {
   pollPlayback,
   updatePlaybackPrewarmStatus,
 } from '../src/playback.js';
+import { attachPlaybackSocketServer } from '../src/playback_event_bus.js';
 
 class MemoryCollection {
   constructor() {
@@ -728,6 +729,90 @@ test('an active device releases remote ownership when its queue is cleared', asy
   assert.equal(result.session.playing, false);
 });
 
+test('playback quality is validated and synchronized through snapshots and commands', async () => {
+  const database = new MemoryDatabase();
+  const time = new Date('2026-11-18T00:00:00.000Z');
+  const deviceId = '0123456789abcdef0123456789abcdef';
+  const listenId = 'listen-abcdefghijklmnop';
+  await database.collection('playback_devices').insertOne({
+    userId: 'user-a',
+    deviceId,
+    name: 'Web player',
+    platform: 'web',
+    lastSeenAt: time,
+  });
+  await database.collection('playback_sessions').insertOne({
+    _id: 'user-a',
+    userId: 'user-a',
+    activeDeviceId: deviceId,
+    trackIds: ['current-track'],
+    index: 0,
+    positionMs: 1_000,
+    durationMs: 180_000,
+    volume: 1,
+    playing: true,
+    shuffle: false,
+    repeat: 'none',
+    title: 'Current track',
+    artist: 'Current artist',
+    queueRevision: 1,
+    revision: 1,
+    playbackEpoch: 1,
+    resumeOnFailover: false,
+  });
+
+  const result = await pollPlayback({
+    userId: 'user-a',
+    collection: (name) => database.collection(name),
+    now: () => time,
+    body: {
+      deviceId,
+      name: 'Web player',
+      platform: 'web',
+      snapshot: {
+        trackIds: ['current-track'],
+        index: 0,
+        positionMs: 1_000,
+        durationMs: 180_000,
+        volume: 1,
+        playing: true,
+        shuffle: false,
+        repeat: 'none',
+        title: 'Current track',
+        artist: 'Current artist',
+        quality: 'high',
+        listenId,
+      },
+    },
+  });
+  assert.equal(result.session.quality, 'high');
+  assert.equal(result.session.listenId, listenId);
+
+  const command = await createPlaybackCommand({
+    userId: 'user-a',
+    action: 'setQuality',
+    payload: { quality: 'low' },
+    expectedRevision: result.session.revision,
+    collection: (name) => database.collection(name),
+    now: () => time,
+  });
+  const storedCommand = await database.collection('playback_commands').findOne({
+    _id: new ObjectId(command.commandId),
+  });
+  assert.deepEqual(storedCommand.payload, { quality: 'low' });
+
+  await assert.rejects(
+    createPlaybackCommand({
+      userId: 'user-a',
+      action: 'setQuality',
+      payload: { quality: 'lossless' },
+      collection: (name) => database.collection(name),
+      now: () => time,
+    }),
+    (error) => error.code === 'invalid_command',
+  );
+});
+
 test('playback polling, handoff, commands, and device visibility are account-scoped', async () => {
   const database = new MemoryDatabase();
   const app = express();
@@ -1220,5 +1305,278 @@ test('playback polling, handoff, commands, and device visibility are account-sco
     assert.equal(staleCommand.body.error, 'stale_playback_state');
   } finally {
     await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('forgetting devices removes offline devices and rejects online or group-claimed devices', async () => {
+  const database = new MemoryDatabase();
+  const time = new Date('2026-11-26T12:00:00.000Z');
+  const offlineId = '0123456789abcdef0123456789abcdef';
+  const onlineId = 'abcdef0123456789abcdef0123456789';
+  const groupId = 'fedcba9876543210fedcba9876543210';
+  database.collection('playback_devices').documents.push(
+    {
+      userId: 'user-a',
+      deviceId: offlineId,
+      lastSeenAt: new Date(time.getTime() - 13_000),
+    },
+    {
+      userId: 'user-a',
+      deviceId: onlineId,
+      lastSeenAt: time,
+    },
+    {
+      userId: 'user-a',
+      deviceId: groupId,
+      lastSeenAt: time,
+      groupSessionId: 'group-a',
+      groupSessionExpiresAt: new Date(time.getTime() + 60_000),
+    },
+  );
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    req.user = { id: 'user-a' };
+    next();
+  });
+  app.use(createPlaybackRouter({
+    collection: (name) => database.collection(name),
+    now: () => time,
+  }));
+  app.use((error, _req, res, _next) => {
+    res.status(error.status || 500).json({ error: error.code || 'internal_error' });
+  });
+  const server = createServer(app);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    const forget = async (deviceId) => {
+      const response = await fetch(
+        `${origin}/playback/devices/${deviceId}`,
+        { method: 'DELETE' },
+      );
+      return { response, body: await response.json() };
+    };
+
+    const offlineResult = await forget(offlineId);
+    assert.equal(offlineResult.response.status, 200);
+    assert.equal(
+      await database.collection('playback_devices').findOne({
+        userId: 'user-a',
+        deviceId: offlineId,
+      }),
+      null,
+    );
+
+    const onlineResult = await forget(onlineId);
+    assert.equal(onlineResult.response.status, 409);
+    assert.equal(onlineResult.body.error, 'device_online');
+
+    const groupResult = await forget(groupId);
+    assert.equal(groupResult.response.status, 409);
+    assert.equal(groupResult.body.error, 'device_in_group_session');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('command acknowledgements persist and publish the active device snapshot immediately', async () => {
+  const database = new MemoryDatabase();
+  const time = new Date('2026-11-26T12:00:00.000Z');
+  const deviceId = '0123456789abcdef0123456789abcdef';
+  const commandId = new ObjectId();
+  database.collection('playback_sessions').documents.push({
+    _id: 'user-a',
+    activeDeviceId: deviceId,
+    trackIds: ['track-a'],
+    index: 0,
+    positionMs: 1000,
+    durationMs: 180_000,
+    playing: true,
+    shuffle: false,
+    repeat: 'none',
+    volume: 1,
+    revision: 3,
+    queueRevision: 1,
+    playbackEpoch: 2,
+  });
+  database.collection('playback_commands').documents.push({
+    _id: commandId,
+    userId: 'user-a',
+    deviceId,
+    action: 'seek',
+    payload: { positionMs: 45_000 },
+    status: 'pending',
+    createdAt: time,
+    deadlineAt: new Date(time.getTime() + 60_000),
+  });
+  const events = [];
+  attachPlaybackSocketServer({
+    to(room) {
+      return {
+        emit(event, payload) {
+          events.push({ room, event, payload });
+        },
+      };
+    },
+  });
+
+  try {
+    const result = await acknowledgePlaybackCommand({
+      userId: 'user-a',
+      commandId: String(commandId),
+      deviceId,
+      status: 'ok',
+      snapshot: {
+        trackIds: ['track-a'],
+        index: 0,
+        positionMs: 45_000,
+        durationMs: 180_000,
+        playing: true,
+        shuffle: false,
+        repeat: 'none',
+        title: 'Track A',
+        artist: 'Artist A',
+        volume: 1,
+        playbackEpoch: 2,
+      },
+      collection: (name) => database.collection(name),
+      now: () => time,
+    });
+
+    const session = await database.collection('playback_sessions').findOne({
+      _id: 'user-a',
+    });
+    assert.equal(result.status, 'ok');
+    assert.equal(session.positionMs, 45_000);
+    assert.equal(session.revision, 4);
+    assert.equal(events.at(-1).event, 'playback:changed');
+    assert.equal(events.at(-1).payload.session.positionMs, 45_000);
+  } finally {
+    attachPlaybackSocketServer(null);
+  }
+});
+
+test('identical active-device polls refresh presence without revising playback state', async () => {
+  const database = new MemoryDatabase();
+  const start = new Date('2026-11-26T12:00:00.000Z');
+  const deviceId = '0123456789abcdef0123456789abcdef';
+  const sessionUpdatedAt = new Date(start.getTime() - 1000);
+  database.collection('playback_sessions').documents.push({
+    _id: 'user-a',
+    activeDeviceId: deviceId,
+    trackIds: ['track-a'],
+    index: 0,
+    positionMs: 1000,
+    durationMs: 180_000,
+    playing: true,
+    shuffle: false,
+    repeat: 'none',
+    volume: 1,
+    title: 'Track A',
+    artist: 'Artist A',
+    revision: 7,
+    queueRevision: 1,
+    playbackEpoch: 2,
+    updatedAt: sessionUpdatedAt,
+  });
+  database.collection('playback_devices').documents.push({
+    userId: 'user-a',
+    deviceId,
+    name: 'Phone',
+    platform: 'android',
+    lastSeenAt: start,
+  });
+  const events = [];
+  attachPlaybackSocketServer({
+    to(room) {
+      return {
+        emit(event, payload) {
+          events.push({ room, event, payload });
+        },
+      };
+    },
+  });
+  const makeSnapshot = (positionMs, playing = true) => ({
+    trackIds: ['track-a'],
+    index: 0,
+    positionMs,
+    durationMs: 180_000,
+    playing,
+    shuffle: false,
+    repeat: 'none',
+    title: 'Track A',
+    artist: 'Artist A',
+    volume: 1,
+    playbackEpoch: 2,
+  });
+
+  try {
+    await pollPlayback({
+      userId: 'user-a',
+      collection: (name) => database.collection(name),
+      now: () => start,
+      body: { deviceId, name: 'Phone', platform: 'android', snapshot: makeSnapshot(2000) },
+    });
+    await pollPlayback({
+      userId: 'user-a',
+      collection: (name) => database.collection(name),
+      now: () => new Date(start.getTime() + 1000),
+      body: {
+        deviceId,
+        name: 'Phone',
+        platform: 'android',
+        snapshot: makeSnapshot(3000),
+      },
+    });
+    let session = await database.collection('playback_sessions').findOne({
+      _id: 'user-a',
+    });
+    assert.equal(session.revision, 7);
+    assert.equal(session.updatedAt, sessionUpdatedAt);
+    assert.equal(
+      database.collection('playback_devices').documents[0].lastSeenAt.getTime(),
+      start.getTime() + 1000,
+    );
+    assert.equal(events.length, 0);
+
+    await pollPlayback({
+      userId: 'user-a',
+      collection: (name) => database.collection(name),
+      now: () => new Date(start.getTime() + 2000),
+      body: {
+        deviceId,
+        name: 'Phone',
+        platform: 'android',
+        snapshot: makeSnapshot(5001),
+      },
+    });
+    session = await database.collection('playback_sessions').findOne({
+      _id: 'user-a',
+    });
+    assert.equal(session.revision, 8);
+    assert.equal(session.positionMs, 5001);
+    assert.equal(events.length, 1);
+
+    await pollPlayback({
+      userId: 'user-a',
+      collection: (name) => database.collection(name),
+      now: () => new Date(start.getTime() + 3000),
+      body: {
+        deviceId,
+        name: 'Phone',
+        platform: 'android',
+        snapshot: makeSnapshot(6001, false),
+      },
+    });
+    session = await database.collection('playback_sessions').findOne({
+      _id: 'user-a',
+    });
+    assert.equal(session.revision, 9);
+    assert.equal(session.playing, false);
+    assert.equal(events.length, 2);
+  } finally {
+    attachPlaybackSocketServer(null);
   }
 });

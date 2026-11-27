@@ -209,6 +209,15 @@ export async function listTracks({ query = '', pageSize, pageToken, ownerId = SH
   };
 }
 
+export async function recentlyAddedTracks(ownerId = SHARED_OWNER_ID, limit = 24) {
+  const rows = await col('drive_tracks')
+    .find(ownerQuery({ availability: 'available' }, ownerId))
+    .sort({ createdTime: -1, _id: 1 })
+    .limit(Math.min(Math.max(Number(limit) || 24, 1), 100))
+    .toArray();
+  return rows.map(trackForApi);
+}
+
 export async function getTrack(id, ownerId = SHARED_OWNER_ID) {
   const documentId = ownerId === SHARED_OWNER_ID ? id : `${ownerId}:${id}`;
   const doc = await col('drive_tracks').findOne(
@@ -231,17 +240,6 @@ export async function getTracksByIds(ids, ownerId = SHARED_OWNER_ID) {
   return rows.map(trackForApi);
 }
 
-export async function getTrackLyrics(id, ownerId = SHARED_OWNER_ID) {
-  const documentId = ownerId === SHARED_OWNER_ID ? id : `${ownerId}:${id}`;
-  const doc = await col('drive_tracks').findOne(
-    ownerQuery({ _id: documentId, availability: 'available' }, ownerId),
-    { projection: { lyrics: 1 } },
-  );
-  return typeof doc?.lyrics === 'string' && doc.lyrics.trim()
-    ? doc.lyrics
-    : null;
-}
-
 function trackForApi(doc) {
   return {
     id: doc.driveFileId,
@@ -255,7 +253,11 @@ function trackForApi(doc) {
     artist: (doc.artists || []).join(', ') || null,
     album: doc.album,
     albumArtist: doc.albumArtist,
+    albumId: doc.albumId,
+    albumArtistId: doc.albumArtistKey,
     genres: doc.genres || [],
+    artistIds: doc.artistKeys || [],
+    genreIds: (doc.genreEntries || []).map((entry) => entry.key),
     year: doc.year,
     trackNumber: doc.trackNumber,
     discNumber: doc.discNumber,

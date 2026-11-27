@@ -38,6 +38,7 @@ class MemoryCollection {
     const existing = this.documents.get(filter._id);
     const document = { ...(existing || {}), ...(update.$set || {}) };
     if (!existing) Object.assign(document, update.$setOnInsert || {});
+    for (const key of Object.keys(update.$unset || {})) delete document[key];
     this.documents.set(filter._id, document);
     return { matchedCount: existing ? 1 : 0 };
   }
@@ -103,7 +104,7 @@ function trackStream(title, lyrics = '') {
   return stream;
 }
 
-test('indexing stores embedded lyrics and upgrades older metadata records', async () => {
+test('indexing ignores embedded lyrics and removes them from older records', async () => {
   const database = new MemoryDatabase();
   const collection = (name) => database.collection(name);
   const file = {
@@ -135,8 +136,44 @@ test('indexing stores embedded lyrics and upgrades older metadata records', asyn
   await syncDriveBatch(drive, { collection, isMongoEnabled: () => true });
   const indexed = tracks.documents.get(file.id);
   assert.equal(opened, true);
-  assert.equal(indexed.lyrics, 'First line\nSecond line');
+  assert.equal(indexed.lyrics, undefined);
   assert.equal(indexed.metadataVersion, 2);
+});
+
+test('unchanged catalog records have legacy lyrics removed without re-reading audio', async () => {
+  const database = new MemoryDatabase();
+  const collection = (name) => database.collection(name);
+  const file = {
+    id: 'legacy-lyrics',
+    name: 'Legacy.mp3',
+    mimeType: 'audio/mpeg',
+    size: '1048576',
+    modifiedTime: '1',
+    md5Checksum: 'legacy',
+  };
+  const tracks = collection('drive_tracks');
+  tracks.documents.set(file.id, {
+    _id: file.id,
+    modifiedTime: file.modifiedTime,
+    md5Checksum: file.md5Checksum,
+    metadataStatus: 'indexed',
+    metadataVersion: 2,
+    lyrics: 'stale embedded lyrics',
+  });
+  let opened = false;
+  const drive = {
+    async getStartPageToken() { return 'change-1'; },
+    async listAudioCandidates() { return { files: [file], nextPageToken: null }; },
+    async openFile() {
+      opened = true;
+      return { stream: trackStream('Legacy') };
+    },
+  };
+
+  await syncDriveBatch(drive, { collection, isMongoEnabled: () => true });
+
+  assert.equal(opened, false);
+  assert.equal(tracks.documents.get(file.id).lyrics, undefined);
 });
 
 test('generated quality MP3 files are excluded from the playable catalog', async () => {

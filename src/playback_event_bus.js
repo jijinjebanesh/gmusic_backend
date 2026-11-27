@@ -150,6 +150,9 @@ export function publishPlaybackEvent(
     session = null,
     serverTimestamp = new Date().toISOString(),
     exceptConnectionId = null,
+    requiresFullSync = !session,
+    deviceListChanged = false,
+    pendingCommandsChanged = false,
   } = {},
 ) {
   if (!io || !userId) return;
@@ -162,6 +165,9 @@ export function publishPlaybackEvent(
   operator.emit('playback:changed', {
     deviceId,
     serverTimestamp,
+    requiresFullSync,
+    ...(deviceListChanged ? { deviceListChanged: true } : {}),
+    ...(pendingCommandsChanged ? { pendingCommandsChanged: true } : {}),
     ...(session
       ? {
           session,

@@ -42,17 +42,96 @@ async function close(io) {
   await new Promise((resolve) => io.close(resolve));
 }
 
+function createPresenceDatabase() {
+  const devices = [
+    {
+      userId: 'user-a',
+      deviceId: DEVICE_A,
+      name: 'Phone',
+      platform: 'android',
+      lastSeenAt: new Date(),
+    },
+    {
+      userId: 'user-a',
+      deviceId: DEVICE_B,
+      name: 'Browser',
+      platform: 'web',
+      lastSeenAt: new Date(),
+    },
+  ];
+  const sessions = [{
+    _id: 'user-a',
+    activeDeviceId: DEVICE_A,
+    trackIds: ['track-a'],
+    index: 0,
+    positionMs: 1000,
+    durationMs: 180_000,
+    playing: true,
+    shuffle: false,
+    repeat: 'none',
+    volume: 1,
+    revision: 1,
+    queueRevision: 1,
+    playbackEpoch: 1,
+    updatedAt: new Date(),
+  }];
+  const matches = (document, filter) => Object.entries(filter).every(([key, value]) => {
+    const actual = document[key];
+    if (value instanceof Date && actual instanceof Date) {
+      return actual.getTime() === value.getTime();
+    }
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      if ('$lte' in value) return actual <= value.$lte;
+      if ('$gt' in value) return actual > value.$gt;
+      return false;
+    }
+    return actual === value;
+  });
+  const collection = (name) => {
+    const documents = name === 'playback_devices'
+      ? devices
+      : name === 'playback_sessions'
+        ? sessions
+        : [];
+    return {
+      async findOne(filter) {
+        return documents.find((document) => matches(document, filter)) || null;
+      },
+      async updateOne(filter, update, { upsert = false } = {}) {
+        let document = documents.find((item) => matches(item, filter));
+        const matchedCount = document ? 1 : 0;
+        if (!document && upsert) {
+          document = Object.fromEntries(
+            Object.entries(filter).filter(([, value]) => value == null || typeof value !== 'object'),
+          );
+          documents.push(document);
+        }
+        if (!document) return { matchedCount: 0 };
+        Object.assign(document, update.$set || {});
+        for (const key of Object.keys(update.$unset || {})) delete document[key];
+        for (const [key, increment] of Object.entries(update.$inc || {})) {
+          document[key] = (document[key] || 0) + increment;
+        }
+        return { matchedCount: matchedCount || 1 };
+      },
+    };
+  };
+  return { devices, sessions, collection };
+}
+
 test('Socket.IO authenticates devices and uses server-authorized account rooms', async () => {
   const server = createServer();
   const polls = [];
   const commandAcknowledgments = [];
+  const authenticationOptions = [];
   let handoffCommit;
   let commandCreated = false;
   let prewarmCreated = false;
   const socketServer = attachPlaybackSocketIO(server, {
     apiToken: 'api-token',
     configureEventBus: () => false,
-    authenticate: async (token) => {
+    authenticate: async (token, _apiToken, options) => {
+      authenticationOptions.push(options);
       if (!token.startsWith('token-')) {
         throw Object.assign(new Error('session_expired'), {
           status: 401,
@@ -138,6 +217,21 @@ test('Socket.IO authenticates devices and uses server-authorized account rooms',
     const [registeredA, registeredPeer, registeredOther] = await Promise.all([
       ack(clientA, 'device:register', {
         device: { deviceId: DEVICE_A, name: 'Phone', platform: 'android' },
+        snapshot: {
+          trackIds: ['track-a'],
+          index: 0,
+          positionMs: 1200,
+          durationMs: 180_000,
+          volume: 0.8,
+          playing: true,
+          shuffle: false,
+          repeat: 'none',
+          title: 'Track A',
+          artist: 'Artist A',
+          quality: 'medium',
+          listenId: 'listen-session-0001',
+          playbackEpoch: 1,
+        },
       }),
       ack(clientPeer, 'device:register', {
         device: { deviceId: DEVICE_B, name: 'Browser', platform: 'web' },
@@ -152,6 +246,8 @@ test('Socket.IO authenticates devices and uses server-authorized account rooms',
     assert.equal(registeredOther.ok, true);
     assert.equal(polls.length, 3);
     assert.equal(polls[0].userId, 'user-a');
+    assert.equal(polls[0].body.snapshot.quality, 'medium');
+    assert.equal(polls[0].body.snapshot.listenId, 'listen-session-0001');
 
     const prewarmAcceptedEvent = once(clientA, 'playback:prewarm:result');
     const prewarmAccepted = await ack(clientA, 'playback:prewarm', {
@@ -265,6 +361,8 @@ test('Socket.IO authenticates devices and uses server-authorized account rooms',
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(changedB, false);
+    assert.ok(authenticationOptions.length > 3);
+    assert.ok(authenticationOptions.every((options) => options?.renew !== false));
   } finally {
     clientA.disconnect();
     clientPeer.disconnect();
@@ -420,6 +518,132 @@ test('group Socket.IO rooms are available only to registered room members', asyn
   } finally {
     member.disconnect();
     outsider.disconnect();
+    await close(socketServer.io);
+  }
+});
+
+test('Socket.IO disconnect marks an active device offline after the grace window', async () => {
+  const server = createServer();
+  const database = createPresenceDatabase();
+  const socketServer = attachPlaybackSocketIO(server, {
+    apiToken: 'api-token',
+    collection: database.collection,
+    disconnectGraceMs: 50,
+    configureEventBus: () => false,
+    authenticate: async () => ({
+      user: { id: 'user-a' },
+      ownerMode: false,
+    }),
+    poll: async ({ userId, body }) => {
+      await database.collection('playback_devices').updateOne(
+        { userId, deviceId: body.deviceId },
+        {
+          $set: {
+            userId,
+            deviceId: body.deviceId,
+            name: body.name,
+            platform: body.platform,
+            lastSeenAt: new Date(),
+          },
+          $unset: { disconnectedAt: '' },
+        },
+        { upsert: true },
+      );
+      return { session: database.sessions[0], devices: [], commands: [] };
+    },
+  });
+  const origin = await listen(server);
+  const owner = connect(origin);
+  const peer = connect(origin);
+  try {
+    await Promise.all([once(owner, 'connect'), once(peer, 'connect')]);
+    await Promise.all([
+      ack(owner, 'device:register', {
+        device: { deviceId: DEVICE_A, name: 'Phone', platform: 'android' },
+      }),
+      ack(peer, 'device:register', {
+        device: { deviceId: DEVICE_B, name: 'Browser', platform: 'web' },
+      }),
+    ]);
+
+    const changedEvent = once(peer, 'playback:changed');
+    const disconnected = once(owner, 'disconnect');
+    owner.disconnect();
+    await disconnected;
+    const [changed] = await changedEvent;
+
+    assert.equal(database.sessions[0].activeDeviceId, DEVICE_A);
+    assert.equal(database.sessions[0].playing, false);
+    assert.equal(database.sessions[0].resumeOnFailover, true);
+    const device = database.devices.find(({ deviceId }) => deviceId === DEVICE_A);
+    assert.equal(device.disconnectedAt, undefined);
+    assert.ok(Date.now() - device.lastSeenAt.getTime() > 12_000);
+    assert.equal(changed.requiresFullSync, true);
+    assert.equal(changed.deviceListChanged, true);
+    assert.equal(changed.session.playing, false);
+  } finally {
+    peer.disconnect();
+    await close(socketServer.io);
+  }
+});
+
+test('reconnecting within the Socket.IO disconnect grace cancels offline marking', async () => {
+  const server = createServer();
+  const database = createPresenceDatabase();
+  const socketServer = attachPlaybackSocketIO(server, {
+    apiToken: 'api-token',
+    collection: database.collection,
+    disconnectGraceMs: 100,
+    configureEventBus: () => false,
+    authenticate: async () => ({
+      user: { id: 'user-a' },
+      ownerMode: false,
+    }),
+    poll: async ({ userId, body }) => {
+      await database.collection('playback_devices').updateOne(
+        { userId, deviceId: body.deviceId },
+        {
+          $set: {
+            userId,
+            deviceId: body.deviceId,
+            name: body.name,
+            platform: body.platform,
+            lastSeenAt: new Date(),
+          },
+          $unset: { disconnectedAt: '' },
+        },
+        { upsert: true },
+      );
+      return { session: database.sessions[0], devices: [], commands: [] };
+    },
+  });
+  const origin = await listen(server);
+  const original = connect(origin);
+  let reconnected;
+  try {
+    await once(original, 'connect');
+    await ack(original, 'device:register', {
+      device: { deviceId: DEVICE_A, name: 'Phone', platform: 'android' },
+    });
+    const disconnected = once(original, 'disconnect');
+    original.disconnect();
+    await disconnected;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    reconnected = connect(origin);
+    await once(reconnected, 'connect');
+    await ack(reconnected, 'device:register', {
+      device: { deviceId: DEVICE_A, name: 'Phone', platform: 'android' },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    assert.equal(database.sessions[0].playing, true);
+    const device = database.devices.find(({ deviceId }) => deviceId === DEVICE_A);
+    assert.equal(device.disconnectedAt, undefined);
+    assert.ok(Date.now() - device.lastSeenAt.getTime() < 12_000);
+  } finally {
+    original.disconnect();
+    reconnected?.disconnect();
     await close(socketServer.io);
   }
 });

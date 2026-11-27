@@ -12,6 +12,11 @@ import {
 import { col, initDb, mongoEnabled } from './db.js';
 import { authRoutes, userDataRoutes, attachUser } from './auth.js';
 import { playbackRoutes } from './playback.js';
+import {
+  createListeningRouter,
+  loadListeningHome,
+  recordListeningEvent,
+} from './listening_history.js';
 import { createGroupListeningRouter } from './group_listening.js';
 import {
   playbackEventsAreShared,
@@ -29,7 +34,6 @@ import {
   getArtist,
   getTrack,
   getTracksByIds,
-  getTrackLyrics,
   genreTracks,
   listAlbums,
   listArtists,
@@ -309,6 +313,20 @@ app.get('/api/v1/drive/oauth/callback', async (req, res) => {
 app.use('/api/v1', attachUser(apiToken));
 app.use('/api/v1', userDataRoutes);
 app.use('/api/v1', playbackRoutes);
+app.use('/api/v1', createListeningRouter({
+  loadHome: (req) => loadListeningHome({
+    userId: req.ownerMode ? null : req.user.id,
+    ownerId: driveOwner(req),
+  }),
+  saveEvent: (req) => recordListeningEvent({
+    userId: req.user.id,
+    deviceId: req.body?.deviceId,
+    event: req.body,
+    events: col('listening_events'),
+    playbackSessions: col('playback_sessions'),
+    recentPlays: col('recent_plays'),
+  }),
+}));
 app.use('/api/v1', createGroupListeningRouter({
   getAccessibleTracks: async (req, ids) =>
     getTracksByIds(ids, driveOwner(req)),
@@ -446,13 +464,7 @@ app.get('/api/v1/catalog/tracks/:id', async (req, res, next) => {
     res.json({ track: withMediaUrls(req, track) });
   } catch (error) { next(error); }
 });
-app.get('/api/v1/catalog/tracks/:id/lyrics', async (req, res, next) => {
-  try {
-    const lyrics = await getTrackLyrics(req.params.id, driveOwner(req));
-    if (lyrics === null) return res.status(404).json({ error: 'lyrics_not_found' });
-    res.json({ lyrics });
-  } catch (error) { next(error); }
-});
+
 app.get('/api/v1/tracks/:id/quality/:quality', async (req, res, next) => {
   try {
     const ownerId = driveOwner(req);
@@ -576,16 +588,35 @@ function artHandler() {
       const ticket = readTicket(req.params.ticket);
       if (!ticket) return res.status(401).end();
       const userDrive = await driveForOwner(ticket.ownerId);
-      const art = await cachedCoverArt(userDrive, ticket.id, ticket.ownerId);
+      const quality = String(req.query.quality || 'original').toLowerCase();
+      if (quality !== 'original' && !RENDITION_QUALITIES[quality]) {
+        return res.status(400).json({ error: 'invalid_quality' });
+      }
+      const source = quality === 'original'
+        ? { fileId: ticket.id, revision: null }
+        : await renditionService.artworkSource({
+          ownerId: ticket.ownerId,
+          trackId: ticket.id,
+          drive: userDrive,
+          quality,
+        });
+      const art = await cachedCoverArt(
+        userDrive,
+        source.fileId,
+        ticket.ownerId,
+        source.revision,
+      );
       if (!art) return res.status(404).end();
       res.setHeader('content-type', art.contentType);
-      res.setHeader('cache-control', 'private, max-age=28800');
+      res.setHeader('cache-control', 'private, max-age=300');
       res.send(art.data);
     } catch (err) { next(err); }
   };
 }
-async function cachedCoverArt(driveSession, fileId, ownerId) {
-  const cacheId = ownerId === 'shared' ? fileId : `${ownerId}:${fileId}`;
+async function cachedCoverArt(driveSession, fileId, ownerId, revision = null) {
+  const cacheId = ownerId === 'shared'
+    ? `${fileId}:${revision || 'original'}`
+    : `${ownerId}:${fileId}:${revision || 'original'}`;
   if (mongoEnabled()) {
     const cached = await col('artwork_cache').findOne({
       _id: cacheId,

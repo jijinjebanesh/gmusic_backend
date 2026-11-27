@@ -5,6 +5,7 @@ import { createServer } from 'node:http';
 import { ObjectId } from 'mongodb';
 import { createGroupListeningRouter } from '../src/group_listening.js';
 import { claimPlaybackDeviceForGroup } from '../src/playback.js';
+import { attachPlaybackSocketServer } from '../src/playback_event_bus.js';
 
 class MemoryCollection {
   constructor() {
@@ -225,6 +226,19 @@ test('group sessions authorize each account and schedule after every online play
   });
 
   const app = express();
+  const groupEvents = [];
+  attachPlaybackSocketServer({
+    to(room) {
+      return {
+        emit(event, payload) {
+          groupEvents.push({ room, event, payload });
+        },
+      };
+    },
+    in() {
+      return { socketsLeave() {} };
+    },
+  });
   app.use(express.json());
   app.use((req, _res, next) => {
     req.user = {
@@ -292,6 +306,12 @@ test('group sessions authorize each account and schedule after every online play
       ).canControlPlayback,
       true,
     );
+    const joinEvent = groupEvents[groupEvents.length - 1];
+    assert.equal(joinEvent.event, 'group:changed');
+    assert.equal(joinEvent.payload.type, 'participants');
+    assert.equal(joinEvent.payload.sessionId, sessionId);
+    assert.equal(joinEvent.payload.room, undefined);
+    assert.equal(joinEvent.payload.participants.length, 2);
     const sameAccountControl = await request(
       `/group-listening/${sessionId}/control`,
       {
@@ -894,5 +914,6 @@ test('group sessions authorize each account and schedule after every online play
     assert.equal(ended.body.room.status, 'ended');
   } finally {
     await new Promise((resolve) => server.close(resolve));
+    attachPlaybackSocketServer(null);
   }
 });

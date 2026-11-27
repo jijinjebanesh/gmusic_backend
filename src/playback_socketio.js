@@ -16,6 +16,7 @@ import {
   createPlaybackHandoff,
   createPlaybackPrewarm,
   cancelPlaybackPrewarm,
+  markPlaybackDeviceOffline,
   pollPlayback,
   updatePlaybackPrewarmStatus,
 } from './playback.js';
@@ -23,6 +24,7 @@ import { attachGroupListeningSocketHandlers } from './group_listening.js';
 
 const SOCKET_PATH = '/api/v1/playback/socket';
 const AUTH_TIMEOUT_MS = 5_000;
+const DISCONNECT_GRACE_MS = 3_000;
 const MAX_EVENTS_PER_WINDOW = 40;
 const RATE_WINDOW_MS = 10_000;
 
@@ -57,6 +59,8 @@ const snapshotSchema = z.object({
   repeat: z.enum(['none', 'one', 'all']),
   title: z.string().max(200).optional(),
   artist: z.string().max(200).optional(),
+  quality: z.enum(['low', 'medium', 'high', 'original']).optional(),
+  listenId: z.string().regex(/^[A-Za-z0-9_-]{16,128}$/).optional(),
   playbackEpoch: z.number().int().nonnegative().optional(),
   advancePlaybackEpoch: z.boolean().optional(),
 }).strict();
@@ -166,11 +170,59 @@ export function attachPlaybackSocketIO(server, {
   createHandoff = createPlaybackHandoff,
   createPrewarm = createPlaybackPrewarm,
   acknowledgeCommand = acknowledgePlaybackCommand,
+  markDeviceOffline = markPlaybackDeviceOffline,
+  disconnectGraceMs = DISCONNECT_GRACE_MS,
   configureEventBus = configurePlaybackEventBus,
   onConnectionError = (error) => {
     console.error('Playback Socket.IO connection failed:', error.name);
   },
 } = {}) {
+  const pendingDisconnectTimers = new Map();
+  const disconnectKey = (userId, deviceId) => `${userId}:${deviceId}`;
+  const clearDisconnectTimer = (userId, deviceId) => {
+    const key = disconnectKey(userId, deviceId);
+    const timer = pendingDisconnectTimers.get(key);
+    if (timer) clearTimeout(timer);
+    pendingDisconnectTimers.delete(key);
+  };
+  const clearAllDisconnectTimers = () => {
+    for (const timer of pendingDisconnectTimers.values()) clearTimeout(timer);
+    pendingDisconnectTimers.clear();
+  };
+  const scheduleDisconnectCheck = (userId, deviceId, disconnectedAt) => {
+    clearDisconnectTimer(userId, deviceId);
+    const key = disconnectKey(userId, deviceId);
+    const timer = setTimeout(async () => {
+      pendingDisconnectTimers.delete(key);
+      try {
+        const roomSockets = await io
+          .in(deviceRoom(userId, deviceId))
+          .fetchSockets();
+        if (roomSockets.length) {
+          await collection('playback_devices').updateOne(
+            { userId, deviceId, disconnectedAt },
+            { $unset: { disconnectedAt: '' } },
+          );
+          return;
+        }
+        await markDeviceOffline({
+          userId,
+          deviceId,
+          disconnectedAt,
+          collection,
+          now,
+        });
+      } catch (error) {
+        console.error(
+          'Failed to finalize playback device disconnect:',
+          error.name,
+        );
+      }
+    }, disconnectGraceMs);
+    timer.unref?.();
+    pendingDisconnectTimers.set(key, timer);
+  };
+
   const io = new Server(server, {
     path: SOCKET_PATH,
     maxHttpBufferSize: 64 * 1024,
@@ -203,7 +255,7 @@ export function attachPlaybackSocketIO(server, {
       return;
     }
     try {
-      const result = await authenticate(token, apiToken, { renew: false });
+      const result = await authenticate(token, apiToken);
       if (result.ownerMode || !result.user?.id || result.user.id === 'owner') {
         logPlaybackSocket('authentication_failed', {
           reason: 'personal_account_required',
@@ -275,7 +327,6 @@ export function attachPlaybackSocketIO(server, {
       const result = await authenticate(
         socket.data.sessionToken,
         apiToken,
-        { renew: false },
       );
       if (result.ownerMode || result.user?.id !== socket.data.userId) {
         throw Object.assign(new Error('session_invalid'), {
@@ -340,6 +391,7 @@ export function attachPlaybackSocketIO(server, {
         await socket.join(userRoom(socket.data.userId));
         await socket.join(deviceRoom(socket.data.userId, device.deviceId));
         const result = await sync(input.snapshot ?? null, input.claim === true);
+        clearDisconnectTimer(socket.data.userId, device.deviceId);
         clearTimeout(authTimeout);
         clearInterval(sessionVerifyTimer);
         sessionVerifyTimer = setInterval(() => {
@@ -580,18 +632,26 @@ export function attachPlaybackSocketIO(server, {
       logPlaybackSocket('disconnected');
       clearTimeout(authTimeout);
       clearInterval(sessionVerifyTimer);
-      // CP-B4: Mark device as disconnected in DB so it doesn't appear online
-      // for up to 12 seconds after the socket drops.
       const currentDevice = device || socket.data?.device;
       if (currentDevice && socket.data?.userId) {
         try {
           const devices = collection?.('playback_devices');
           if (typeof devices?.updateOne === 'function') {
-            devices.updateOne(
+            const disconnectedAt = now();
+            Promise.resolve(devices.updateOne(
               { userId: socket.data.userId, deviceId: currentDevice.deviceId },
-              { $set: { disconnectedAt: now() } },
-            ).catch((err) => {
-              console.error('Failed to update disconnectedAt on disconnect:', err.name);
+              { $set: { disconnectedAt } },
+            )).then(() => {
+              scheduleDisconnectCheck(
+                socket.data.userId,
+                currentDevice.deviceId,
+                disconnectedAt,
+              );
+            }).catch((err) => {
+              console.error(
+                'Failed to update disconnectedAt on disconnect:',
+                err.name,
+              );
             });
           }
         } catch (err) {
@@ -603,11 +663,15 @@ export function attachPlaybackSocketIO(server, {
   });
 
   attachGroupListeningSocketHandlers(io, { collection, now });
+  server.on('close', clearAllDisconnectTimers);
 
   return {
     io,
     eventBusReady,
     path: SOCKET_PATH,
-    close: () => io.close(),
+    close: () => {
+      clearAllDisconnectTimers();
+      return io.close();
+    },
   };
 }

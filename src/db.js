@@ -50,6 +50,13 @@ async function ensureIndexes() {
   await favorites.createIndex({ userId: 1, trackId: 1 }, { unique: true }).catch((e) => console.warn('fav idx:', e.message));
   const recent = db.collection('recent_plays');
   await recent.createIndex({ userId: 1, playedAt: -1 }).catch((e) => console.warn('recent idx:', e.message));
+  const listeningEvents = db.collection('listening_events');
+  await listeningEvents.createIndex({ userId: 1, playedAt: -1 });
+  await listeningEvents.createIndex({ userId: 1, trackId: 1 });
+  await listeningEvents.createIndex(
+    { userId: 1, eventId: 1 },
+    { unique: true, partialFilterExpression: { eventId: { $exists: true } } },
+  );
   const playlists = db.collection('playlists');
   await playlists.createIndex({ userId: 1, name: 1 }, { unique: true, partialFilterExpression: { name: { $exists: true } } }).catch((e) => console.warn('pl idx:', e.message));
   await db.collection('search_history').createIndex({ userId: 1, queryKey: 1 }, { unique: true });
@@ -64,6 +71,7 @@ async function ensureIndexes() {
   }
   await tracks.createIndex({ ownerId: 1, driveFileId: 1 }, { unique: true });
   await tracks.createIndex({ ownerId: 1, availability: 1, title: 1, _id: 1 });
+  await tracks.createIndex({ ownerId: 1, availability: 1, createdTime: -1 });
   await tracks.createIndex({ ownerId: 1, artistKeys: 1, availability: 1 });
   await tracks.createIndex({ ownerId: 1, albumId: 1, discNumber: 1, trackNumber: 1 });
   await tracks.createIndex({ ownerId: 1, 'genreEntries.key': 1, availability: 1 });
@@ -82,6 +90,10 @@ async function ensureIndexes() {
     { unique: true },
   );
   await db.collection('playback_devices').createIndex({ userId: 1, lastSeenAt: -1 });
+  await db.collection('playback_devices').createIndex(
+    { lastSeenAt: 1 },
+    { expireAfterSeconds: 30 * 24 * 60 * 60 },
+  );
   await db.collection('playback_sessions').createIndex({ userId: 1 }, { unique: true });
   const playbackCommands = db.collection('playback_commands');
   await playbackCommands.createIndex({ userId: 1, deviceId: 1, status: 1, createdAt: 1 });

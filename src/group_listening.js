@@ -199,14 +199,16 @@ function publicRoom(room, time, userId = null) {
   };
 }
 
-async function updateRoom(groups, roomId, mutate, time) {
+async function updateRoom(groups, roomId, mutate, time, decorate) {
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const current = await groups.findOne({ _id: roomId });
     if (!current || current.status === 'ended') {
       throw apiError(404, 'group_session_not_found');
     }
-    const next = mutate({ ...current, members: [...(current.members || [])] });
-    if (next === current) return current;
+    const draft = { ...current, members: [...(current.members || [])] };
+    const mutated = mutate(draft);
+    if (mutated === draft) return current;
+    const next = decorate ? decorate(current, mutated) : mutated;
     next.stateVersion = (current.stateVersion || 0) + 1;
     next.updatedAt = time;
     const { _id, ...fields } = next;
@@ -495,6 +497,7 @@ export function createGroupListeningRouter({
           pauseAtServerTimeMs: null,
           pausePositionMs: null,
           processedCommands: [],
+          processedCommandsVersion: 1,
           status: 'paused',
           trackIds,
           index,
@@ -866,15 +869,25 @@ export function createGroupListeningRouter({
       const commandId = /^[A-Za-z0-9_-]{16,128}$/.test(suppliedCommandId)
         ? suppliedCommandId
         : crypto.randomUUID();
+      const sessionObjectId = parseSessionId(req.params.sessionId);
+      const groupCollection = groups();
+      await groupCollection.updateOne(
+        {
+          _id: sessionObjectId,
+          processedCommandsVersion: { $ne: 1 },
+          members: { $elemMatch: { userId: req.user.id, deviceId } },
+        },
+        { $set: { processedCommands: [], processedCommandsVersion: 1 } },
+      );
       const { room, member } = await requireMember(
-        groups(), req.params.sessionId, req.user.id, deviceId, time,
+        groupCollection, req.params.sessionId, req.user.id, deviceId, time,
       );
       const duplicate = (room.processedCommands || []).find(
         (entry) => entry.commandId === commandId,
       );
-      if (duplicate?.room) {
+      if (duplicate) {
         res.json({
-          room: publicRoom(duplicate.room, time, req.user.id),
+          room: publicRoom(room, time, req.user.id),
           actorMemberId: duplicate.actorMemberId,
           duplicate: true,
         });
@@ -914,7 +927,8 @@ export function createGroupListeningRouter({
           getAccessibleTracks,
         );
       }
-      const mutated = await updateRoom(groups(), room._id, (current) => {
+      let duplicateCommand = false;
+      const updated = await updateRoom(groupCollection, room._id, (current) => {
         const currentMember = (current.members || []).find(
           (item) => item.memberId === member.memberId,
         );
@@ -927,6 +941,12 @@ export function createGroupListeningRouter({
             !hasPlaybackControl(current, currentMember)) {
           throw apiError(403, 'forbidden_playback_control');
         }
+        if ((current.processedCommands || []).some(
+          (entry) => entry.commandId === commandId,
+        )) {
+          duplicateCommand = true;
+          return current;
+        }
         const currentPosition = roomPosition(current, time);
         switch (action) {
           case 'play':
@@ -938,7 +958,7 @@ export function createGroupListeningRouter({
               startAtServerTime: null,
             }, time);
           case 'pause':
-            if (!current.playing) return current;
+            if (!current.playing) return { ...current };
             {
               const pauseAt = new Date(time.getTime() + GROUP_PAUSE_LEAD_MS);
               const positionMs = roomPosition(current, time) +
@@ -1261,9 +1281,8 @@ export function createGroupListeningRouter({
           default:
             throw apiError(400, 'invalid_group_command');
         }
-      }, time);
-      const updatedWithControl = await updateRoom(groups(), mutated._id, (current) => ({
-        ...current,
+      }, time, (current, mutated) => ({
+        ...mutated,
         lastControlActorMemberId: member.memberId,
         lastControlAction: action,
         processedCommands: [
@@ -1273,12 +1292,19 @@ export function createGroupListeningRouter({
           {
             commandId,
             actorMemberId: member.memberId,
-            room: current,
             createdAt: time,
           },
         ],
-      }), time);
-      const updated = updatedWithControl;
+        processedCommandsVersion: 1,
+      }));
+      if (duplicateCommand) {
+        res.json({
+          room: publicRoom(updated, time, req.user.id),
+          actorMemberId: member.memberId,
+          duplicate: true,
+        });
+        return;
+      }
       if (updated.status === 'ended') {
         await Promise.all(updated.members.map((item) =>
           releasePlaybackDeviceFromGroup({

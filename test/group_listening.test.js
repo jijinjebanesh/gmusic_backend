@@ -294,6 +294,19 @@ test('group sessions authorize each account and schedule after every online play
     );
     const sessionId = created.body.room.sessionId;
     const invitationCode = created.body.room.invitationCode;
+    await database.collection('group_listening_sessions').updateOne(
+      { _id: new ObjectId(sessionId) },
+      {
+        $set: {
+          processedCommandsVersion: 0,
+          processedCommands: [{
+            commandId: 'legacy-command-entry-0001',
+            actorMemberId: 'legacy-member',
+            room: { processedCommands: [{ room: { recursive: true } }] },
+          }],
+        },
+      },
+    );
 
     const sameAccountJoin = await request('/group-listening/join', {
       method: 'POST',
@@ -320,11 +333,27 @@ test('group sessions authorize each account and schedule after every online play
           deviceId: hostDeviceId,
           action: 'seek',
           positionMs: 7_000,
+          commandId: 'seek-retry-command-0001',
         },
       },
     );
     assert.equal(sameAccountControl.response.status, 200);
     assert.equal(sameAccountControl.body.room.positionMs, 7_000);
+    const retriedControl = await request(
+      `/group-listening/${sessionId}/control`,
+      {
+        method: 'POST',
+        body: {
+          deviceId: hostDeviceId,
+          action: 'seek',
+          positionMs: 9_000,
+          commandId: 'seek-retry-command-0001',
+        },
+      },
+    );
+    assert.equal(retriedControl.response.status, 200);
+    assert.equal(retriedControl.body.duplicate, true);
+    assert.equal(retriedControl.body.room.positionMs, 7_000);
     const shuffleEnabled = await request(
       `/group-listening/${sessionId}/control`,
       {
@@ -370,6 +399,14 @@ test('group sessions authorize each account and schedule after every online play
       },
     );
     assert.equal(repeatFromLastTrack.body.room.index, 0);
+    const commandCache = await database
+      .collection('group_listening_sessions')
+      .findOne({ _id: new ObjectId(sessionId) });
+    assert.equal(commandCache.processedCommandsVersion, 1);
+    assert.equal(commandCache.processedCommands.length, 5);
+    assert.ok(commandCache.processedCommands.every(
+      (entry) => !('room' in entry),
+    ));
 
     const sameAccountLeave = await request(
       `/group-listening/${sessionId}/leave`,
